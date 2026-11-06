@@ -83,6 +83,131 @@ def redact_registered_vault_values(text: str) -> str:
             text = text.replace(value, "«redacted-vault-secret»")
     return text
 
+
+# ---------------------------------------------------------------------------
+# Fleet-secret redaction registry (R-01, profile-scoped, bounded, memory-only)
+# ---------------------------------------------------------------------------
+# Sibling to the vault registry above, NOT a merge: vault secrets (browser_vault fills) and fleet
+# secrets (this fleet's own live .env values: API keys, Buzz private key, DB passwords, etc.) have
+# different lifetimes and must be independently clearable — rotating a fleet credential must not
+# evict an in-flight browser-vault fill's protection, and vice versa. Same shape, same invariants:
+# memory-only (NEVER logged or persisted — a registry of exact secret values that itself leaked
+# would be worse than the gap it closes), bounded per profile, keyed by `_vault_scope()` so a
+# multiplex gateway never scrubs profile B's output with profile A's secrets.
+_FLEET_SECRET_MAX_PER_PROFILE = 64
+_FLEET_SECRET_VALUES: dict = {}   # profile home -> ordered {value: None}
+_FLEET_SECRET_LOCK = threading.Lock()
+_FLEET_SECRET_SEEDED_SCOPES: set = set()   # scopes that have completed at least one seed pass
+_FLEET_SECRET_SEED_LOCK = threading.Lock()
+
+
+def register_fleet_secret_value(value) -> None:
+    """Register an exact fleet-secret value (a live credential from this fleet's own .env layers)
+    for model-facing and persistence-facing redaction. Never logs or echoes *value* — callers must
+    not pass it to logging either (see ``seed_fleet_secrets_from_dotenv``)."""
+    if not isinstance(value, str) or not value:
+        return
+    normalized = value.replace("\r", "").replace("\n", "")
+    with _FLEET_SECRET_LOCK:
+        bucket = _FLEET_SECRET_VALUES.setdefault(_vault_scope(), {})
+        for v in (value, normalized):
+            if v:
+                bucket.pop(v, None)  # re-registering refreshes recency
+                bucket[v] = None
+        while len(bucket) > _FLEET_SECRET_MAX_PER_PROFILE:
+            del bucket[next(iter(bucket))]
+
+
+def clear_fleet_secret_values(*, scope: str | None = None) -> None:
+    """Drop the current (or named) profile's registered fleet-secret values."""
+    with _FLEET_SECRET_LOCK:
+        _FLEET_SECRET_VALUES.pop(scope if scope is not None else _vault_scope(), None)
+
+
+def _fleet_secret_fingerprint(value: str) -> str:
+    """Non-reversible 8-hex-char tag so a human/log can tell a fleet-secret hit from a vault-secret
+    hit or a shape-regex mask, without the tag itself being reusable as a credential fragment."""
+    import hashlib
+    return hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+
+
+def redact_registered_fleet_secrets(text: str | None) -> str | None:
+    """Exact-substring scrub of every fleet-secret value registered for the current profile.
+    Marker is ``[REDACTED:<fp>]`` — deterministically distinct from the vault marker
+    (``«redacted-vault-secret»``, no fingerprint) and from every shape-regex mask (which keep a
+    vendor-prefix head), so a reviewer can tell which layer caught a given hit."""
+    if not isinstance(text, str) or not text:
+        return text
+    with _FLEET_SECRET_LOCK:
+        bucket = _FLEET_SECRET_VALUES.get(_vault_scope())
+        values = sorted(bucket, key=len, reverse=True) if bucket else ()
+    for value in values:
+        if value in text:
+            text = text.replace(value, f"[REDACTED:{_fleet_secret_fingerprint(value)}]")
+    return text
+
+
+def redact_registered_secrets_exact(text: str | None) -> str | None:
+    """Exact-match-only scrub (vault registry + fleet registry, NEVER the shape regexes) — the pass
+    Boundary 2 (message persistence) uses. Shape regexes are tuned for human-readable tool output
+    and could mis-fire on arbitrary stored content (code, JSON blobs, non-English text); the exact
+    registries carry no such risk because they only ever match a byte-for-byte live secret value."""
+    if not isinstance(text, str) or not text:
+        return text
+    text = redact_registered_vault_values(text)
+    text = redact_registered_fleet_secrets(text)
+    return text
+
+
+def seed_fleet_secrets_from_dotenv(*, force: bool = False) -> int:
+    """Register every value from this profile's authoritative dotenv layers into the fleet-secret
+    registry. Reuses ``hermes_cli.env_loader.resolve_home_dotenv`` — the SAME dotenv-parsing path
+    ``load_hermes_dotenv`` uses to publish values at process start — and reads ONLY those files,
+    never ``os.environ`` and never ``/proc/<pid>/environ`` (the dotenv-mutation lesson in
+    `secret-safe-credential-audit`: an env var already published to the process can have been
+    edited/stripped by something else since, but the file on disk is still authoritative for what
+    THIS profile considers a live secret).
+
+    Idempotent per profile scope unless ``force=True`` (used by the Task 7 rotation re-seed hook):
+    a lazy call site (first redaction/persistence call in a fresh process) seeds once; a rotation
+    re-seed clears the scope's "already seeded" marker and the registry, then reseeds from the
+    now-rotated files, so a stale value is not defended indefinitely and a new one is protected
+    without a process restart.
+
+    Returns the number of values registered (never the values themselves) — safe to log.
+    """
+    scope = _vault_scope()
+    with _FLEET_SECRET_SEED_LOCK:
+        if not force and scope in _FLEET_SECRET_SEEDED_SCOPES:
+            return 0
+        try:
+            from hermes_cli.env_loader import resolve_home_dotenv
+            from hermes_constants import get_hermes_home
+            values = resolve_home_dotenv(get_hermes_home())
+        except Exception:
+            logger.warning("seed_fleet_secrets_from_dotenv: dotenv resolution failed (scope unchanged)")
+            return 0
+        count = 0
+        for v in values.values():
+            if isinstance(v, str) and len(v) >= 8:  # skip trivially-short values (flags like "true", "1")
+                register_fleet_secret_value(v)
+                count += 1
+        _FLEET_SECRET_SEEDED_SCOPES.add(scope)
+        return count
+
+
+def reseed_fleet_secrets() -> int:
+    """Task 7: rotation re-seed hook, callable at any time with no process restart. Drops the
+    current profile's registry and the current scope's "seeded" marker, then re-parses the dotenv
+    layers fresh — so a rotated-out value stops being defended (evicted immediately, not retained)
+    while the newly-rotated-in value becomes protected on the very next redaction/persistence call.
+    Never logs or returns a value; returns the post-reseed registration count only."""
+    scope = _vault_scope()
+    clear_fleet_secret_values(scope=scope)
+    with _FLEET_SECRET_SEED_LOCK:
+        _FLEET_SECRET_SEEDED_SCOPES.discard(scope)
+    return seed_fleet_secrets_from_dotenv(force=True)
+
 # Sensitive query-string param names (case-insensitive): opaque tokens / OAuth
 # codes / pre-signed signatures with no vendor prefix.
 # Ported from nearai/ironclaw#2529 — catches tokens whose values don't match any known vendor prefix regex
@@ -1483,8 +1608,13 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     text = text if isinstance(text, str) else str(text)
     if not text:
         return text
-    # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
+    # Vault + fleet secrets are a hard model-egress boundary: scrubbed regardless of the
+    # redact_secrets preference (R-01). Lazy per-scope seed: the first call in a fresh process
+    # populates the fleet registry from this profile's own dotenv layers; cheap no-op after that
+    # (single dict/set membership check) until a rotation calls reseed_fleet_secrets().
+    seed_fleet_secrets_from_dotenv()
     text = redact_registered_vault_values(text)
+    text = redact_registered_fleet_secrets(text)
     if not (force or _redact_enabled()):
         return text
     # ``secret_file`` is authoritative: a caller that classified the source as secret-bearing must not

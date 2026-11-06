@@ -271,10 +271,24 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         message_timestamp: float, *, keep_reasoning: bool) -> tuple:
         """Bind values for ``_INSERT_MESSAGE_SQL`` from one message dict (*tool_calls* already parsed;
         *keep_reasoning* False NULLs every reasoning column). ``platform_message_id`` falls back to
-        ``message_id`` (yuanbao's message-dict convention)."""
+        ``message_id`` (yuanbao's message-dict convention).
+
+        R-01 Boundary 2 (defensive, independent of Boundary 1): every string field that can carry
+        free-form model/tool text — ``content``, ``reasoning``, ``reasoning_content``,
+        ``reasoning_details``, ``api_content`` — passes through the EXACT-MATCH-ONLY registry scrub
+        (``redact_registered_secrets_exact``: vault + fleet registries, never the shape regexes —
+        those are tuned for human-readable tool output and could mis-fire on arbitrary stored
+        content) immediately before this tuple is built, so a gap in Boundary 1 (a tool nobody wired
+        yet, a future new tool) cannot alone land a known secret in ``messages`` — and since the FTS
+        mirrors are populated by triggers that copy from this same row, they inherit the fix for
+        free.
+        """
+        from agent.redact import redact_registered_secrets_exact as _exact_scrub
         _str_or_none = lambda v: _scrub_surrogates(v) if isinstance(v, str) else None
         _reasoning = lambda key: msg.get(key) if keep_reasoning else None
         encoded_content = self._encode_content(msg.get("content"))
+        if isinstance(encoded_content, str):
+            encoded_content = _exact_scrub(encoded_content)
         encoded_tool_calls = json.dumps(tool_calls) if tool_calls else None
         encoded_tool_name = _scrub_surrogates(msg.get("tool_name"))
         display_metadata = msg.get("display_metadata")
@@ -288,15 +302,20 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             "tool_name": encoded_tool_name, "display_kind": msg.get("display_kind"),
             "display_metadata": display_metadata,
         }
+        _reasoning_scrubbed = lambda key: _exact_scrub(_reasoning(key)) if isinstance(_reasoning(key), str) else _reasoning(key)
+        def _reasoning_json_scrubbed(key):
+            v = self._reasoning_json_text(_reasoning(key))
+            return _exact_scrub(v) if isinstance(v, str) else v
         return (session_id, role, encoded_content, msg.get("tool_call_id"),
             encoded_tool_calls, encoded_tool_name,
             msg.get("effect_disposition"), message_timestamp, msg.get("token_count"), msg.get("finish_reason"),
-            _scrub_surrogates(_reasoning("reasoning")), _scrub_surrogates(_reasoning("reasoning_content")),
-            *(self._reasoning_json_text(_reasoning(k))
-              for k in ("reasoning_details", "codex_reasoning_items", "codex_message_items")),
+            _scrub_surrogates(_reasoning_scrubbed("reasoning")), _scrub_surrogates(_reasoning_scrubbed("reasoning_content")),
+            _reasoning_json_scrubbed("reasoning_details"), _reasoning_json_scrubbed("codex_reasoning_items"),
+            _reasoning_json_scrubbed("codex_message_items"),
             msg.get("platform_message_id") or msg.get("message_id"),
             1 if msg.get("observed") else 0, 1 if msg.get("_compressed_summary") else 0, 1,
-            _str_or_none(msg.get("api_content")), _str_or_none(msg.get("display_kind")),
+            _str_or_none(_exact_scrub(msg.get("api_content")) if isinstance(msg.get("api_content"), str) else msg.get("api_content")),
+            _str_or_none(msg.get("display_kind")),
             display_metadata, self._display_identity(self._display_dedupe_key(identity_row)),
             message_uid_or_none(msg), _absorbed_uids_json(msg),
             _tool_call_uids_json(msg), _tool_call_uid_or_none(msg))

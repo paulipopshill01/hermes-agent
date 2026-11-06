@@ -93,6 +93,13 @@ def spill_if_oversized(
         from tools.spill_safety import ensure_spill_dir, write_text_exclusive
         # Hook context may embed raw secrets: private perms + exclusive,
         # symlink-refusing create (the per-session dir is predictable).
+        # R-01 Task 5: full redaction pass (shape regexes + exact-match registries) BEFORE either
+        # the spill file or the in-context preview is built — a hook can echo a live credential
+        # (e.g. a crashing provider SDK dumping its own auth header) and this is the one write site
+        # for that content outside append_message, so it needs the full pass, not just the
+        # exact-match-only one Boundary 2 uses.
+        from agent.redact import redact_sensitive_text
+        text = redact_sensitive_text(text, force=True)
         ensure_spill_dir(spill_dir, private=True)
         spill_path = spill_dir / f"{uuid.uuid4().hex}.txt"
         # Trailing newline so tail readers don't report "missing newline".

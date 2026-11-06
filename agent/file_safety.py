@@ -436,6 +436,58 @@ def raise_if_read_blocked(path: str) -> None:
         raise ValueError(blocked)
 
 
+# ---------------------------------------------------------------------------
+# R-01 Task 6: deny-by-default secret-bearing globs (defense-in-depth, soft)
+# ---------------------------------------------------------------------------
+# Unlike ``_BLOCKED_PROJECT_ENV_BASENAMES`` above (hard block, no override — these ARE always
+# credential files), the paths here are only *sometimes* secret-bearing (a docker-compose.yml with
+# an embedded DB password; a rotated-out ``*.env.bak``; a ``state.db`` dump; a queued
+# ``pending/**/*.json`` payload; a debug ``request_dump_*.json``) — a real, legitimate need to read
+# one in full exists (debugging a compose file, inspecting a queued job), so the default is
+# metadata-only with an explicit, named override, not an unconditional block. Either way, full
+# content served under the override still passes through ``redact_sensitive_text`` same as any
+# other read (Boundary 1) — this control only changes whether content is served by DEFAULT, not
+# whether it is ever redacted.
+import fnmatch
+
+# Patterns matched against the BASENAME only (a parent directory coincidentally containing the
+# substring, e.g. a temp test dir named "...backup...", must never trigger this).
+_SECRET_BEARING_BASENAME_GLOBS: tuple[str, ...] = (
+    "*backup*", "*.bak", "docker-compose*.yml", "docker-compose*.yaml",
+    "state.db*", "request_dump_*", "request_dump_*.json",
+)
+# Patterns that need a directory component and are matched against the full normalized path.
+_SECRET_BEARING_PATH_GLOBS: tuple[str, ...] = (
+    "*/pending/*.json",
+)
+
+
+def secret_bearing_glob_reason(path: str) -> Optional[str]:
+    """Return a reason string when *path* (any form — relative, absolute, resolved, or not) matches
+    one of the R-01 Task 6 deny-by-default globs; ``None`` otherwise."""
+    if not isinstance(path, str) or not path:
+        return None
+    normalized = path.replace("\\", "/")
+    basename = normalized.rsplit("/", 1)[-1]
+    for pattern in _SECRET_BEARING_BASENAME_GLOBS:
+        if fnmatch.fnmatch(basename, pattern):
+            return (
+                f"'{path}' matches a secret-bearing path pattern ({pattern!r}) and defaults to "
+                "metadata only to prevent credential leakage. Pass full_content_override=true if "
+                "you specifically need the full content — it will still be scrubbed for any live "
+                "fleet secret before being returned."
+            )
+    for pattern in _SECRET_BEARING_PATH_GLOBS:
+        if fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch("/" + normalized.lstrip("/"), pattern):
+            return (
+                f"'{path}' matches a secret-bearing path pattern ({pattern!r}) and defaults to "
+                "metadata only to prevent credential leakage. Pass full_content_override=true if "
+                "you specifically need the full content — it will still be scrubbed for any live "
+                "fleet secret before being returned."
+            )
+    return None
+
+
 def _resolve_active_profile_name() -> str:
     """Active profile name from HERMES_HOME: ``~/.hermes`` -> ``"default"``,
     ``~/.hermes/profiles/X`` -> ``"X"``; ``"default"`` on any resolution failure."""

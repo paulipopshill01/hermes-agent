@@ -616,6 +616,16 @@ def skill_view(
     or path ("axolotl", "03-fine-tuning/axolotl"); "<plugin>:<skill>" resolves plugin-provided
     skills. ``preprocess`` applies the configured SKILL.md template / inline shell rendering;
     slash/preload callers render the message themselves."""
+    from agent.redact import redact_sensitive_text
+    # R-01 Boundary 1: a skill (or a file served within its directory via `file_path`) is
+    # arbitrary file content from disk, same class as read_file — a fixture/example secret, or a
+    # skill whose directory shares a tree with a secret-bearing file, must not reach the model
+    # unredacted just because it came through this tool instead of read_file.
+    return redact_sensitive_text(_skill_view_impl(name, file_path, task_id, preprocess), file_read=True)
+
+
+def _skill_view_impl(
+    name: str, file_path: str | None = None, task_id: str | None = None, preprocess: bool = True) -> str:
     try:
         # Validate before the ':' dispatch so a Windows drive path (C:\skills\foo) can't be
         # reinterpreted as a plugin namespace.

@@ -602,16 +602,38 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     return count
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default",
+                   full_content_override: bool = False) -> str:
     """Read a file with pagination and line numbers.
 
     Guard order: NT/device-namespace prefix (raw string, no resolution) →
     device-path blocklist (no I/O) → stat-based special-file guard (host only)
-    → Hermes internal denylist → document extraction → binary-extension guard
-    → negative-result cache → dedup stub → real read.
+    → Hermes internal denylist → R-01 Task 6 secret-bearing-glob default-deny
+    → document extraction → binary-extension guard → negative-result cache →
+    dedup stub → real read.
+
+    ``full_content_override``: explicit opt-in to read full content of a path matching the
+    secret-bearing glob list (``*backup*``, ``docker-compose*.yml``, ``state.db*``,
+    ``pending/*.json``, ``request_dump_*``, …). Ignored for paths that don't match. Content served
+    under the override still passes through Boundary 1 redaction exactly like any other read.
     """
     try:
         offset, limit = normalize_read_pagination(offset, limit)
+
+        if not full_content_override:
+            from agent.file_safety import secret_bearing_glob_reason
+            glob_reason = secret_bearing_glob_reason(path)
+            if glob_reason:
+                _meta: dict = {}
+                try:
+                    _meta_resolved = _resolve_path_for_task(path, task_id)
+                    _st = os.stat(str(_meta_resolved))
+                    _meta = {"file_size": _st.st_size, "modified": _st.st_mtime}
+                except Exception:
+                    pass
+                return json.dumps({
+                    "success": False, "metadata_only": True, "path": path,
+                    "note": glob_reason, **_meta}, ensure_ascii=False)
 
         # On the RAW model-supplied string, before any expanduser()/resolve():
         # on Windows resolving \??\UNC\host\share already sends SMB auth (NTLM
@@ -1011,6 +1033,8 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            if result_dict.get("diff"):
+                result_dict["diff"] = redact_sensitive_text(result_dict["diff"], file_read=True)
             if stale_warnings:
                 result_dict["_warning"] = " | ".join(stale_warnings)
             if not result_dict.get("error"):
@@ -1054,8 +1078,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str | None = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
                 order: str = "discovery",
-                task_id: str = "default") -> str:
-    """Search for content or files."""
+                task_id: str = "default", full_content_override: bool = False) -> str:
+    """Search for content or files.
+
+    ``full_content_override``: explicit opt-in to show matched CONTENT (``output_mode="content"``)
+    for paths matching the R-01 Task 6 secret-bearing glob list; without it, such matches keep their
+    path/line but have their content replaced with a metadata-only note. ``files_only``/``count``
+    modes are unaffected (they never carried content). Content shown under the override still passes
+    through Boundary 1 redaction exactly like any other search result.
+    """
     try:
         offset, limit = normalize_search_pagination(offset, limit)
 
@@ -1103,17 +1134,30 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context, order=order)
         omitted = _filter_read_blocked_search_results(result, task_id)
+        glob_metadata_only = 0
         for m in getattr(result, "matches", None) or ():
             if getattr(m, "content", None):
+                _resolved_m_path = _resolved_match_path(m.path, task_id)
+                if output_mode == "content" and not full_content_override:
+                    from agent.file_safety import secret_bearing_glob_reason
+                    _glob_reason = secret_bearing_glob_reason(_resolved_m_path) or secret_bearing_glob_reason(m.path)
+                    if _glob_reason:
+                        m.content = f"[metadata only: {_glob_reason}]"
+                        glob_metadata_only += 1
+                        continue
                 m.content = redact_sensitive_text(
                     m.content, file_read=True,
-                    secret_file=_is_secret_file_arg(_resolved_match_path(m.path, task_id)))
+                    secret_file=_is_secret_file_arg(_resolved_m_path))
         result_dict = result.to_dict(densify=True)
 
         if omitted:
             result_dict["_omitted"] = (
                 f"{omitted} result(s) omitted because they target credential, "
                 "token, cache, or secret-bearing environment files.")
+        if glob_metadata_only:
+            result_dict["_metadata_only"] = (
+                f"{glob_metadata_only} result(s) had content suppressed (secret-bearing path "
+                "pattern — pass full_content_override=true if you specifically need it).")
 
         # No early return on a cached miss — same rationale as the read path.
         _search_err = result_dict.get("error") or ""
@@ -1165,7 +1209,8 @@ READ_FILE_SCHEMA = {
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": DEFAULT_READ_LIMIT, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": DEFAULT_READ_LIMIT, "maximum": 2000},
+            "full_content_override": {"type": "boolean", "description": "Explicit opt-in to read full content of a path matching a secret-bearing pattern (backups, docker-compose files, state.db, pending/*.json, request_dump_*) — such paths default to metadata only. Content is still scrubbed for any live fleet secret.", "default": False}
         },
         "required": ["path"]
     }
@@ -1306,7 +1351,8 @@ SEARCH_FILES_SCHEMA = {
             "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
             "order": {"type": "string", "enum": ["discovery", "modified"], "description": "File-search order: 'discovery' is fast bounded traversal order; 'modified' is exact global newest-first and may scan the full tree; ignored for content", "default": "discovery"},
             "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
+            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0},
+            "full_content_override": {"type": "boolean", "description": "Explicit opt-in to show matched content (content mode) for paths matching a secret-bearing pattern (backups, docker-compose files, state.db, pending/*.json, request_dump_*) — such matches default to metadata only. Content is still scrubbed for any live fleet secret.", "default": False}
         },
         "required": ["pattern"]
     }
@@ -1315,7 +1361,8 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", DEFAULT_READ_LIMIT), task_id=tid)
+    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", DEFAULT_READ_LIMIT), task_id=tid,
+                          full_content_override=bool(args.get("full_content_override", False)))
 
 
 def _handle_write_file(args, **kw):
@@ -1383,7 +1430,8 @@ def _handle_search_files(args, **kw):
         pattern=args.get("pattern", ""), target=target, path=path,
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0),
-        order=args.get("order", "discovery"), task_id=tid)
+        order=args.get("order", "discovery"), task_id=tid,
+        full_content_override=bool(args.get("full_content_override", False)))
 
 
 def _read_file_schema_overrides():

@@ -606,6 +606,21 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int |
                    after: str | None = None, before: str | None = None, exclude_session_ids: Optional[list[str]] = None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
+    result = _session_search_impl(
+        query, role_filter, limit, db, current_session_id, session_id, around_message_id,
+        window, sort, profile, detail, after=after, before=before, exclude_session_ids=exclude_session_ids)
+    # R-01 Boundary 1: session_search replays raw historical message content straight from
+    # state.db, with no prior redaction pass (unlike read_file/search_files/terminal). A secret
+    # that leaked into the transcript BEFORE Boundary 2 landed (or one a model typed itself, which
+    # Boundary 2 never saw) would otherwise be replayed back into a NEW conversation verbatim.
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(result, file_read=True)
+
+
+def _session_search_impl(query: str = "", role_filter: str | None = None, limit: int | None = None, db=None,
+                   current_session_id: str | None = None, session_id: str | None = None, around_message_id: int | None = None,
+                   window: int = 5, sort: str | None = None, profile: str | None = None, detail: str = "adaptive",
+                   after: str | None = None, before: str | None = None, exclude_session_ids: Optional[list[str]] = None) -> str:
     from hermes_constants import get_hermes_home
     from hermes_state import SessionDB, format_session_db_unavailable
     from hermes_state_registry import release_or_close
