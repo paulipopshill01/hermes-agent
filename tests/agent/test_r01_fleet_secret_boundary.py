@@ -112,6 +112,94 @@ class TestTask2Registry:
         finally:
             reset_hermes_home_override(token_a)
 
+    def test_root_layer_scrubbed_under_profile_scope_f1(self, tmp_path):
+        """F-1: a root-home .env value must be registered (and scrubbed) under a PROFILE scope too
+        — not just under the root scope itself — while profile-own values stay isolated."""
+        root_home = tmp_path / "root_home"
+        profiles_dir = root_home / "profiles"
+        profile_a = profiles_dir / "profile_a"
+        profile_b = profiles_dir / "profile_b"
+        profile_a.mkdir(parents=True)
+        profile_b.mkdir(parents=True)
+        root_secret = "ROOTLAYERSECRETVALUEZZZ1928374655aabbccdd"
+        (root_home / ".env").write_text(f"FLEET_WIDE_ROOT_SECRET={root_secret}\n")
+        profile_a_secret = "PROFILEAOWNSECRETVALUE0987654321deadbeef"
+        profile_b_secret = "PROFILEBOWNSECRETVALUE1122334455feedface"
+        (profile_a / ".env").write_text(f"PROFILE_A_SECRET={profile_a_secret}\n")
+        (profile_b / ".env").write_text(f"PROFILE_B_SECRET={profile_b_secret}\n")
+
+        token_a = set_hermes_home_override(str(profile_a))
+        try:
+            redact.seed_fleet_secrets_from_dotenv(force=True)
+            # Root-layer value IS scrubbed under profile_a's scope (the F-1 fix).
+            assert redact.redact_registered_fleet_secrets(root_secret) != root_secret
+            # Profile_a's own value is registered too.
+            assert redact.redact_registered_fleet_secrets(profile_a_secret) != profile_a_secret
+            # Profile_b's own value must NOT leak into profile_a's registry.
+            assert redact.redact_registered_fleet_secrets(profile_b_secret) == profile_b_secret
+        finally:
+            reset_hermes_home_override(token_a)
+
+        token_b = set_hermes_home_override(str(profile_b))
+        try:
+            redact.seed_fleet_secrets_from_dotenv(force=True)
+            # Root-layer value is ALSO scrubbed under profile_b's independent scope.
+            assert redact.redact_registered_fleet_secrets(root_secret) != root_secret
+            assert redact.redact_registered_fleet_secrets(profile_b_secret) != profile_b_secret
+            # Profile_a's own value must NOT leak into profile_b's registry.
+            assert redact.redact_registered_fleet_secrets(profile_a_secret) == profile_a_secret
+        finally:
+            reset_hermes_home_override(token_b)
+
+    def test_profile_value_wins_root_on_same_key_f1(self, tmp_path):
+        """A same-named key set in both layers: the profile's own value must still be the one
+        registered as THAT key's value (profile layer applied on top of root)."""
+        root_home = tmp_path / "root_home2"
+        profiles_dir = root_home / "profiles"
+        profile_a = profiles_dir / "profile_a"
+        profile_a.mkdir(parents=True)
+        root_value = "ROOTDEFAULTVALUEFORSHAREDKEYAA00112233"
+        profile_value = "PROFILEOVERRIDEVALUEFORSHAREDKEYBB99887766"
+        (root_home / ".env").write_text(f"SHARED_KEY={root_value}\n")
+        (profile_a / ".env").write_text(f"SHARED_KEY={profile_value}\n")
+
+        token = set_hermes_home_override(str(profile_a))
+        try:
+            redact.seed_fleet_secrets_from_dotenv(force=True)
+            assert redact.redact_registered_fleet_secrets(profile_value) != profile_value
+        finally:
+            reset_hermes_home_override(token)
+
+
+class TestTask2RegistrationFloorF3:
+    def test_short_or_low_entropy_values_not_registered(self, scoped_home):
+        """F-3: a <12-char value and a low-entropy value must NOT be registered even though they
+        would have passed the old >=8-char-only floor; a genuine long, high-entropy secret must
+        still be registered."""
+        genuine_secret = "Tr0ub4dor&3xtraRandomSuffix99!"  # len 31, high entropy
+        short_value = "shortval12"  # len 10 < 12
+        low_entropy_value = "aaaaaaaaaaaaaaaaaaaa"  # len 20, entropy ~0
+        (scoped_home / ".env").write_text(
+            f"GENUINE_SECRET={genuine_secret}\n"
+            f"SHORT_CONFIG={short_value}\n"
+            f"LOW_ENTROPY_CONFIG={low_entropy_value}\n"
+        )
+        redact.seed_fleet_secrets_from_dotenv(force=True)
+        bucket = redact._FLEET_SECRET_VALUES.get(str(scoped_home), {})
+        assert genuine_secret in bucket
+        assert short_value not in bucket
+        assert low_entropy_value not in bucket
+
+    def test_benign_config_word_not_clipped_f3(self, scoped_home):
+        """Direct regression for the materialized FP: an 8-char low-entropy config value used to
+        get registered under the old floor and clip a legitimate word containing it as a
+        substring. Under the new floor it must not even be registered."""
+        low_entropy_8 = "disabled"  # len 8, low entropy common word
+        (scoped_home / ".env").write_text(f"SOME_MODE={low_entropy_8}\n")
+        redact.seed_fleet_secrets_from_dotenv(force=True)
+        out = redact.redact_registered_fleet_secrets("service is disabled now")
+        assert out == "service is disabled now"
+
 
 class TestTask3BoundaryOnePerTool:
     def test_marker_format_distinct_from_vault_and_shape_masks(self, scoped_home):
@@ -223,6 +311,22 @@ class TestTask6DenyByDefaultGlobs:
         assert secret_bearing_glob_reason(str(tmp_path / "state.db")) is not None
         assert secret_bearing_glob_reason(str(tmp_path / "request_dump_abc_20261101.json")) is not None
         assert secret_bearing_glob_reason(str(tmp_path / "normal_source_file.py")) is None
+
+    def test_env_star_glob_covers_noncanonical_variants_f2(self, tmp_path):
+        """F-2: plan's .env* glob was omitted; non-canonical .env variants must now be caught."""
+        from agent.file_safety import secret_bearing_glob_reason
+        for name in (
+            ".env.old", ".env.save", ".env.dist", ".env.prod",
+            ".env.production.local", "app.env", "secrets.env",
+        ):
+            assert secret_bearing_glob_reason(str(tmp_path / name)) is not None, name
+
+    def test_env_example_and_template_stay_fully_readable_f2(self, tmp_path):
+        """Documented sanctioned substitute (the hard-block message itself names .env.example)
+        must stay exempt from the new .env* glob — otherwise its one legitimate purpose breaks."""
+        from agent.file_safety import secret_bearing_glob_reason
+        assert secret_bearing_glob_reason(str(tmp_path / ".env.example")) is None
+        assert secret_bearing_glob_reason(str(tmp_path / ".env.template")) is None
 
     def test_read_file_default_metadata_only_for_glob_match(self, tmp_path):
         target = tmp_path / "app.backup"

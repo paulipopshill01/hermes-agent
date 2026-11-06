@@ -159,14 +159,53 @@ def redact_registered_secrets_exact(text: str | None) -> str | None:
     return text
 
 
+def _shannon_entropy_bits_per_char(value: str) -> float:
+    """Shannon entropy of *value* in bits/char. Used only to decide whether a dotenv value looks
+    secret-shaped enough to register (F-3) — never logged, operates on the value in memory only."""
+    if not value:
+        return 0.0
+    import math
+    from collections import Counter
+
+    length = len(value)
+    counts = Counter(value)
+    return -sum((n / length) * math.log2(n / length) for n in counts.values())
+
+
+# F-3: registration floor. Every genuine secret on this fleet is len >= 16, H >= 3.85 bits/char
+# (Monte Carlo + corpus verified by Viktor's closure review); short/low-entropy dotenv values are
+# non-secret config (flags, short IDs, common words) whose exact-substring registration clips
+# legitimate tool output (e.g. the word "disabled" containing a registered 8-char value). No
+# security loss from this floor — it only excludes values that were never secrets to begin with.
+_FLEET_SECRET_MIN_LEN = 12
+_FLEET_SECRET_MIN_ENTROPY = 3.0
+
+
+def _meets_fleet_secret_registration_floor(value) -> bool:
+    """True when *value* is long enough and random-looking enough to be worth exact-match
+    registering as a fleet secret (F-3 fix). Never logs or returns the value itself."""
+    if not isinstance(value, str) or len(value) < _FLEET_SECRET_MIN_LEN:
+        return False
+    return _shannon_entropy_bits_per_char(value) >= _FLEET_SECRET_MIN_ENTROPY
+
+
 def seed_fleet_secrets_from_dotenv(*, force: bool = False) -> int:
-    """Register every value from this profile's authoritative dotenv layers into the fleet-secret
-    registry. Reuses ``hermes_cli.env_loader.resolve_home_dotenv`` — the SAME dotenv-parsing path
+    """Register every value from this fleet's authoritative dotenv layers into the fleet-secret
+    registry: the shared root home's ``.env`` (+ its administrator-managed ``.env``, via
+    ``resolve_home_dotenv``) UNION the active profile's own ``.env`` layer. Reuses
+    ``hermes_cli.env_loader.resolve_home_dotenv`` — the SAME dotenv-parsing path
     ``load_hermes_dotenv`` uses to publish values at process start — and reads ONLY those files,
     never ``os.environ`` and never ``/proc/<pid>/environ`` (the dotenv-mutation lesson in
     `secret-safe-credential-audit`: an env var already published to the process can have been
     edited/stripped by something else since, but the file on disk is still authoritative for what
     THIS profile considers a live secret).
+
+    F-1 fix: the root home's layer is unioned into EVERY profile scope's registry (root secrets —
+    e.g. a fleet-wide Buzz private key or GitHub token — are shared infrastructure, not a "profile's
+    own" secret, so broadcasting them to every scope cannot cross-contaminate one profile's secrets
+    into another's). Profile-layer values stay scope-isolated exactly as before: only the active
+    scope's own ``.env`` ever contributes its profile-local values, and on a same-named key the
+    profile's own value wins over the root default (profile layer merged on top).
 
     Idempotent per profile scope unless ``force=True`` (used by the Task 7 rotation re-seed hook):
     a lazy call site (first redaction/persistence call in a fresh process) seeds once; a rotation
@@ -182,14 +221,20 @@ def seed_fleet_secrets_from_dotenv(*, force: bool = False) -> int:
             return 0
         try:
             from hermes_cli.env_loader import resolve_home_dotenv
-            from hermes_constants import get_hermes_home
-            values = resolve_home_dotenv(get_hermes_home())
+            from hermes_constants import get_default_hermes_root, get_hermes_home
+
+            home = get_hermes_home()
+            # Root layer first, profile layer merged on top so a same-named key's profile value
+            # wins. When home == root (default/no-profile scope) this is simply idempotent.
+            values: dict = {}
+            values.update(resolve_home_dotenv(get_default_hermes_root(home=home)))
+            values.update(resolve_home_dotenv(home))
         except Exception:
             logger.warning("seed_fleet_secrets_from_dotenv: dotenv resolution failed (scope unchanged)")
             return 0
         count = 0
         for v in values.values():
-            if isinstance(v, str) and len(v) >= 8:  # skip trivially-short values (flags like "true", "1")
+            if _meets_fleet_secret_registration_floor(v):
                 register_fleet_secret_value(v)
                 count += 1
         _FLEET_SECRET_SEEDED_SCOPES.add(scope)

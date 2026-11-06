@@ -452,10 +452,19 @@ import fnmatch
 
 # Patterns matched against the BASENAME only (a parent directory coincidentally containing the
 # substring, e.g. a temp test dir named "...backup...", must never trigger this).
+# F-2 fix: plan Task 6 named ".env*" explicitly; non-canonical .env variants (.env.old, .env.save,
+# .env.dist, .env.prod, .env.production.local, app.env, secrets.env, ...) hit neither the hard
+# block above (canonical basenames only) nor these globs before this fix.
 _SECRET_BEARING_BASENAME_GLOBS: tuple[str, ...] = (
     "*backup*", "*.bak", "docker-compose*.yml", "docker-compose*.yaml",
     "state.db*", "request_dump_*", "request_dump_*.json",
+    ".env*", "*.env",
 )
+# Explicitly exempt from the ".env*" glob above: these are the documented SANCTIONED SUBSTITUTE
+# the hard-block message itself points users to ("read .env.example instead" — see
+# get_read_block_error) for checking a project's env-file shape. Soft-blocking them too would
+# defeat that escape hatch, so they stay served in full by default like any other source file.
+_ENV_GLOB_EXEMPT_BASENAMES = frozenset({".env.example", ".env.template", ".env.sample"})
 # Patterns that need a directory component and are matched against the full normalized path.
 _SECRET_BEARING_PATH_GLOBS: tuple[str, ...] = (
     "*/pending/*.json",
@@ -469,14 +478,15 @@ def secret_bearing_glob_reason(path: str) -> Optional[str]:
         return None
     normalized = path.replace("\\", "/")
     basename = normalized.rsplit("/", 1)[-1]
-    for pattern in _SECRET_BEARING_BASENAME_GLOBS:
-        if fnmatch.fnmatch(basename, pattern):
-            return (
-                f"'{path}' matches a secret-bearing path pattern ({pattern!r}) and defaults to "
-                "metadata only to prevent credential leakage. Pass full_content_override=true if "
-                "you specifically need the full content — it will still be scrubbed for any live "
-                "fleet secret before being returned."
-            )
+    if basename.lower() not in _ENV_GLOB_EXEMPT_BASENAMES:
+        for pattern in _SECRET_BEARING_BASENAME_GLOBS:
+            if fnmatch.fnmatch(basename, pattern):
+                return (
+                    f"'{path}' matches a secret-bearing path pattern ({pattern!r}) and defaults to "
+                    "metadata only to prevent credential leakage. Pass full_content_override=true if "
+                    "you specifically need the full content — it will still be scrubbed for any live "
+                    "fleet secret before being returned."
+                )
     for pattern in _SECRET_BEARING_PATH_GLOBS:
         if fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch("/" + normalized.lstrip("/"), pattern):
             return (
