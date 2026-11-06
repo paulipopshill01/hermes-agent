@@ -2334,6 +2334,10 @@ def cmd_update(args):
     else:
         from hermes_cli.update_receipt import COMMAND_BOUNDARY_STOP_REASON
 
+        from hermes_cli.post_update_guard import enforce_snapshot_scrub
+
+        enforce_snapshot_scrub(PROJECT_ROOT, stream=sys.stdout)
+
         _finalize_update_receipt(0, COMMAND_BOUNDARY_STOP_REASON)
 
     finally:
