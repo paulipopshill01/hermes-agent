@@ -224,16 +224,29 @@ def seed_fleet_secrets_from_dotenv(*, force: bool = False) -> int:
             from hermes_constants import get_default_hermes_root, get_hermes_home
 
             home = get_hermes_home()
-            # Root layer first, profile layer merged on top so a same-named key's profile value
-            # wins. When home == root (default/no-profile scope) this is simply idempotent.
-            values: dict = {}
-            values.update(resolve_home_dotenv(get_default_hermes_root(home=home)))
-            values.update(resolve_home_dotenv(home))
+            # F-1 fix (Stella Gate 2 spot-check, t_f2a00395): register the UNION of VALUES across
+            # both layers, not a key-keyed last-write-wins dict. A same-named key with a genuinely
+            # different value per layer (e.g. each profile's own BUZZ_PRIVATE_KEY shadowing root's
+            # fleet-wide one) must have BOTH values protected under this scope's registry — a plain
+            # dict.update() merge silently evicts the root value from the registration set the
+            # moment a profile redefines the same key, so root's live secret never gets scrubbed
+            # under that profile's scope. Collecting values from each layer independently (instead
+            # of merging into one key->value dict first) preserves both regardless of key collisions.
+            # This does not change which value callers OTHER than the redaction registry see for a
+            # given key (os.environ / dotenv resolution elsewhere is untouched) — purely additive to
+            # the set of values defended against leaking.
+            root_values = resolve_home_dotenv(get_default_hermes_root(home=home))
+            profile_values = resolve_home_dotenv(home)
+            all_values = list(root_values.values()) + list(profile_values.values())
         except Exception:
             logger.warning("seed_fleet_secrets_from_dotenv: dotenv resolution failed (scope unchanged)")
             return 0
         count = 0
-        for v in values.values():
+        seen = set()
+        for v in all_values:
+            if v in seen:
+                continue
+            seen.add(v)
             if _meets_fleet_secret_registration_floor(v):
                 register_fleet_secret_value(v)
                 count += 1

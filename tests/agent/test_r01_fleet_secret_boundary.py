@@ -170,6 +170,32 @@ class TestTask2Registry:
         finally:
             reset_hermes_home_override(token)
 
+    def test_same_key_different_value_both_scrubbed_f1(self, tmp_path):
+        """Stella Gate 2 spot-check (t_f2a00395): root and a profile define the SAME key name with
+        a GENUINELY DIFFERENT value (e.g. each agent's own distinct BUZZ_PRIVATE_KEY shadowing the
+        root fleet-wide one). A plain key-keyed dict.update() merge lets the profile's value evict
+        root's from the registration set entirely, so root's live secret is never scrubbed under
+        that profile's scope — exactly the real-world collision that slipped past the two separate
+        single-purpose fixtures above. Both values must be independently registered and scrubbed."""
+        root_home = tmp_path / "root_home3"
+        profiles_dir = root_home / "profiles"
+        profile_a = profiles_dir / "profile_a"
+        profile_a.mkdir(parents=True)
+        root_value = "ROOTSHAREDKEYDIFFERENTVALUEzz9988776655"
+        profile_value = "PROFILESHAREDKEYDIFFERENTVALUEyy1122334455"
+        (root_home / ".env").write_text(f"BUZZ_PRIVATE_KEY={root_value}\n")
+        (profile_a / ".env").write_text(f"BUZZ_PRIVATE_KEY={profile_value}\n")
+
+        token = set_hermes_home_override(str(profile_a))
+        try:
+            redact.seed_fleet_secrets_from_dotenv(force=True)
+            # Both the root-layer value AND the profile-layer value under the SAME key name must
+            # be scrubbed under this profile's scope -- neither evicts the other.
+            assert redact.redact_registered_fleet_secrets(root_value) != root_value
+            assert redact.redact_registered_fleet_secrets(profile_value) != profile_value
+        finally:
+            reset_hermes_home_override(token)
+
 
 class TestTask2RegistrationFloorF3:
     def test_short_or_low_entropy_values_not_registered(self, scoped_home):
