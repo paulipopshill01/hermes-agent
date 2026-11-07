@@ -32,10 +32,163 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "HERMES_RPC_|HERMES_KERNEL_DIR)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# --- secret-shaped env names (Viktor credential-exposure findings 1-3, CWE-312) -----------
+# Single source of truth: BOTH the in-loop `unset` (case globs, matched against a
+# case-normalised name) and the post-dump fail-closed net (POSIX ERE) are generated from
+# this table, so widening one can never leave the other behind. Shape kinds:
+#   "exact"    — the whole name equals the token (bare `PASSWORD`)
+#   "suffix"   — the name ends with the token (`GITHUB_TOKEN`)
+#   "contains" — the token appears anywhere in the name (`GCP_CREDENTIALS`)
+# The leading underscore on most suffix tokens is deliberate: `*_KEY` must NOT match
+# `MY_MONKEY` (positive control — a scrub that eats ordinary vars gets switched off).
+_SECRET_NAME_SHAPES: tuple[tuple[str, str], ...] = (
+    ("suffix", "_TOKEN"), ("suffix", "_KEY"), ("suffix", "_SECRET"), ("suffix", "_PASSWORD"),
+    ("suffix", "_PASSPHRASE"),
+    ("suffix", "_PASSWD"), ("suffix", "_PASS"), ("suffix", "_AUTH"), ("suffix", "_BEARER"),
+    ("suffix", "_KEY_ID"), ("suffix", "_DSN"),
+    # No-separator compound names (`STRIPE_APIKEY`, `GITHUB_AUTHTOKEN`, `SSH_PRIVATEKEY`).
+    ("suffix", "APIKEY"), ("suffix", "AUTHTOKEN"), ("suffix", "PRIVATEKEY"),
+    ("contains", "_CREDENTIAL"),
+    ("exact", "PASSWORD"), ("exact", "PASSWD"), ("exact", "PASS"),
+    ("exact", "TOKEN"), ("exact", "KEY"), ("exact", "SECRET"),
+)
+
+
+def _secret_name_glob_pattern() -> str:
+    """``case``-glob alternation for an already UPPER-CASED name (bash 3.2 and 5 alike)."""
+    return "|".join(
+        token if kind == "exact" else f"*{token}" if kind == "suffix" else f"*{token}*"
+        for kind, token in _SECRET_NAME_SHAPES)
+
+
+_SECRET_NAME_ERE = "(" + "|".join(
+    token if kind == "exact"
+    else f"[A-Za-z0-9_]*{token}" if kind == "suffix"
+    else f"[A-Za-z0-9_]*{token}[A-Za-z0-9_]*"
+    for kind, token in _SECRET_NAME_SHAPES) + ")"
+
+# Credentials-in-URL value shapes (Viktor Finding 3, re-review Finding 6): a connection
+# string with ``user:password@`` carries secrets whatever the variable is called, so no
+# name set can cover the class. Both the in-loop ``unset`` (case glob) and the post-dump
+# fail-closed net (POSIX ERE) come from this table to guarantee the two can never drift.
+# The ERE is deliberately tighter than the glob: ``://user:pass@`` requires a non-empty
+# user and the ``user:pass@`` shape (``https://host:8443/img@2x`` is a port + path, no
+# credentials; dropping it would withhold a whole snapshot on a single low-signal false
+# positive).  Both the loop and the net match against the full declaration line value,
+# which for a non-multiline export is ``declare -x NAME="value"``.
+_SECRET_VALUE_SHAPES: tuple[tuple[str, str], ...] = (
+    # (case glob, POSIX ERE on the declaration-line value portion)
+    ("*://*:*@*", r"://[^/:@[:space:]]+:[^/@[:space:]]*@"),
+)
+
+
+def _secret_value_glob_pattern() -> str:
+    """``case``-glob alternation for an already-exported value (bash 3.2 and 5 alike)."""
+    return "|".join(glob for glob, _ere in _SECRET_VALUE_SHAPES)
+
+
+_SECRET_VALUE_ERE = "(" + "|".join(ere for _glob, ere in _SECRET_VALUE_SHAPES) + ")"
+
+# A line ``export -p`` can emit for a secret-shaped exported variable. Covers the
+# readonly form (``declare -rx``) and builds whose ``export -p`` prints ``export NAME=``.
+# Matched case-insensitively: a lower-/mixed-case name in the environment is still the
+# same secret. Two arms joined by alternation:
+#   * name arm: ``NAME=`` immediately after the declaration keyword — the ``=`` anchor
+#     keeps the match on the declaration line only, so continuation lines of a multi-line
+#     value are never mistaken for one.
+#   * value arm: ``.*VALUE_ERE`` — catches credentials in the value of an innocently
+#     named variable (``DB_URL=postgres://user:pass@host/db``). The ``.*`` is safe because
+#     the name arm already takes priority on the declaration header.  A readonly export
+#     whose value shape DOES match the loop glob but DOES NOT match the tightened ERE
+#     (e.g. ``https://cdn.example.com:8443/img@2x.png``) will be published; the omission
+#     direction (a credential-free URL is not a secret) is the accepted false-positive risk.
+_SNAPSHOT_SECRET_DECL_ERE = (
+    rf"^(declare -[A-Za-z]*x[A-Za-z]*|export) "
+    rf"({_SECRET_NAME_ERE}=|.*{_SECRET_VALUE_ERE})")
+
 # mktemp template suffix + the shell variable holding the allocated temp path.
 _SNAP_TMP_SUFFIX = ".tmp.XXXXXXXXXX"
 _SNAP_TMP = '"$__hermes_snap_tmp"'
 
+
+
+def _secret_scrub_snippet() -> str:
+    """Unset secret-shaped exports before ``export -p`` writes the snapshot.
+
+    Case normalisation goes through ``tr`` deliberately: ``${var^^}`` is a **bash 4.0**
+    operator and this module supports the macOS bash 3.2 baseline ("``${!PREFIX*}`` is
+    bash 3.2+", "macOS bash 3.2 lacks ``$BASHPID``"). On 3.2 it raises *bad
+    substitution* on every iteration, ``unset`` never runs, and the caller's ``|| true``
+    turns that into a silently published full secret dump (Viktor Finding 1, CWE-755).
+    The name rules come from ``_SECRET_NAME_SHAPES`` so the net below can never drift
+    narrower than this loop.
+
+    The value-shape rule drops connection strings carrying credentials in the URL
+    (``postgres://user:pw@host/db``) whatever the variable is called, which no name
+    pattern can catch (Finding 3). ``${!name-}`` indirect expansion is bash 3.2-safe and
+    survives a caller's ``set -u``.
+    """
+    return (
+        "for __hermes_sv in $(compgen -A export 2>/dev/null); do "
+        '__hermes_sv_up=$(printf %s "$__hermes_sv" | tr "[:lower:]" "[:upper:]"); '
+        f'case "$__hermes_sv_up" in {_secret_name_glob_pattern()}) unset "$__hermes_sv" ;; esac; '
+        f'case "${{!__hermes_sv-}}" in {_secret_value_glob_pattern()}) unset "$__hermes_sv" ;; esac; '
+        "done; "
+    )
+
+
+def _snapshot_publish_guard(tmp_path: str) -> str:
+    """Fail-closed net over the assembled snapshot: run after the dump, before the ``mv``.
+
+    The in-loop scrub is best-effort by construction. A ``readonly`` exported secret
+    cannot be removed at all (``unset`` *and* ``declare +r`` are refused on it), and a
+    broken ``tr``/``compgen`` degrades the loop to a no-op — neither failure is
+    observable from inside the loop. So the last line of defence reads the finished
+    snapshot and, on any secret-shaped declaration, replaces it with a no-op stub
+    instead of publishing it. Losing the persisted shell state is the deliberate trade:
+    a snapshot is re-derived on the next command, an at-rest credential is not.
+
+    A *broken* ``grep`` (rc > 1) counts as a hit too — every unknown resolves to
+    "withhold", never to "publish". Only diagnostic output carries names; values are
+    never echoed. The reason is also written into the stub as a comment, because the
+    per-command wrapper silences the group's stderr.
+
+    The guard is wrapped in a brace group so its internal semicolon-separated ``if``
+    statements do not split the caller's ``&&`` chain: ``dump && { guard; } && mv`` is
+    one predicate. The name-extraction pipeline is guarded with ``|| true`` so a
+    ``set -e`` profile with a broken ``paste`` still reaches the ``printf`` below
+    instead of dying first.  The fail-closed ``printf`` stub (which replaces the dump
+    with a safe no-op) runs AFTER the names are read but BEFORE ``echo`` writes them
+    to stderr, so a broken ``echo``/stderr cannot abort before the file is neutralised.
+    The final ``[ ]`` test gates the ``mv``: a ``printf`` failure stops publication
+    (the file is already truncated by the redirect, so an incomplete stub carries no
+    secrets, but a failed write never validates and the caller's ``|| rm -f`` cleans
+    it up).
+    """
+    q_ere = shlex.quote(_SNAPSHOT_SECRET_DECL_ERE)
+    leak_names = (
+        f"grep -Ei {q_ere} {tmp_path} 2>/dev/null | "
+        "sed -E 's/^(declare -[A-Za-z]*x[A-Za-z]*|export) ([A-Za-z0-9_]+)=.*/\\2/' | "
+        "paste -sd' ' -")
+    return (
+        "{ "
+        f"if grep -Eiq {q_ere} {tmp_path} 2>/dev/null; then __hermes_sv_rc=0; "
+        "else __hermes_sv_rc=$?; fi; "
+        'if [ "$__hermes_sv_rc" -ne 1 ]; then '
+        f"__hermes_sv_stub=0; "
+        # Read the names BEFORE the printf truncates the temp file; || true
+        # keeps a failing pipeline from killing a ``set -e`` bootstrap.
+        f"__hermes_sv_names=$({leak_names}) || true; "
+        '__hermes_sv_msg="hermes: snapshot withheld (secret-shaped declarations survived '
+        'the scrub: ${__hermes_sv_names:-unknown})"; '
+        # Fail-closed action: replace the dump with a no-op stub.  The redirect
+        # truncates the file, so no secrets survive even if the command fails mid-way.
+        # After this, the echo (diagnostic output) cannot leak values.
+        f"printf '%s\\n' ':' \"# $__hermes_sv_msg\" 'set +e' 'set +u' > {tmp_path} || __hermes_sv_stub=$?; "
+        'echo "$__hermes_sv_msg" >&2 || true; '
+        "fi; "
+        '[ "${__hermes_sv_stub-0}" -eq 0 ]; }'
+    )
 
 def _cwd_marker(session_id: str) -> str:
     return f"__HERMES_CWD_{session_id}__"
@@ -98,6 +251,7 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     # become shell syntax (valid names stay unquoted by shlex.quote()).
     safe_names = {name for name in excluded_names if isinstance(name, str) and name}
     extra_unset = "".join(f" {shlex.quote(name)}" for name in sorted(safe_names))
+    secret_scrub = _secret_scrub_snippet()
     return (
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers re-exported
@@ -113,6 +267,7 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # on the backend and outlive the private dir it protects.
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"{secret_scrub}"
         "export -p; ) || true; } "
         f"> {tmp_path}")
 
@@ -138,8 +293,13 @@ def _snapshot_bootstrap_script(
         f"echo 'shopt -s expand_aliases' >> {_SNAP_TMP}\n"
         f"echo 'set +e' >> {_SNAP_TMP}\n"
         f"echo 'set +u' >> {_SNAP_TMP}\n"
-        # Publish only if assembly succeeded; otherwise drop the partial temp.
-        f"mv -f {_SNAP_TMP} {quoted_snap} || rm -f {_SNAP_TMP}\n"
+        # Fail-closed: a snapshot holding a secret-shaped declaration (readonly export,
+        # broken scrub) is replaced by a no-op stub rather than published.  The
+        # guard gates the mv: a failed stub write skips publication entirely, and
+        # the rm cleans up the (already truncated) temp file.  Under ``set -e`` the
+        # ``&& … ||`` list is safe because errexit is ignored for non-last commands
+        # in an AND-OR chain.
+        f"{{ {_snapshot_publish_guard(_SNAP_TMP)}; }} && "        f"mv -f {_SNAP_TMP} {quoted_snap} || rm -f {_SNAP_TMP}\n"
         f"builtin cd -- {quoted_cwd} 2>/dev/null || true\n"
         f"{_cwd_marker_printf(cwd_marker)}\n")
 
@@ -195,6 +355,7 @@ def _wrap_command_script(
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
             f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "
+            f"&& {_snapshot_publish_guard(_SNAP_TMP)} "
             f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
     if capture:
