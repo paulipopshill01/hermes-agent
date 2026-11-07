@@ -176,3 +176,164 @@ def test_checkout_reset_to_origin_main_keeps_scrub_sentinels(tmp_path: Path):
     assert problems == [], (
         "checkout reset to origin/main lost the scrub hardening -- this is "
         f"the exact recurrence t_79e44797 closes. Problems: {problems}")
+
+
+# --- Option 2 defense-in-depth: pinned-blob auto-restore (t_20438626) -------
+
+
+def _real_pinned_blob_bytes() -> bytes:
+    """The live repo's pinned restore blob, read once for test fixtures."""
+    repo_root = sanitise_path(Path(__file__).resolve().parents[2])
+    from hermes_cli.post_update_guard import PINNED_BLOB_REL
+    return (repo_root / PINNED_BLOB_REL).read_bytes()
+
+
+def test_pinned_blob_hash_constant_matches_committed_blob():
+    """Sanity: PINNED_BLOB_SHA256 must match the blob actually committed to the
+    repo, or every restore in prod would correctly (but uselessly) refuse."""
+    from hermes_cli.post_update_guard import PINNED_BLOB_SHA256
+    import hashlib
+    digest = hashlib.sha256(_real_pinned_blob_bytes()).hexdigest()
+    assert digest == PINNED_BLOB_SHA256, (
+        "committed pinned blob drifted from the hash constant in "
+        "post_update_guard.py -- update them together")
+
+
+def test_pinned_restore_succeeds_on_exact_hash_match(tmp_path: Path):
+    """Missing guard + a hash-verified pinned blob => auto-restore repairs the
+    tree, the existing evidence path still fires, and enforce reports True."""
+    from hermes_cli.post_update_guard import PINNED_BLOB_REL
+
+    root = tmp_path
+    blob_path = root / PINNED_BLOB_REL
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.write_bytes(_real_pinned_blob_bytes())
+
+    scrub_file = root / SNAPSHOT_SCRUB_REL
+    scrub_file.parent.mkdir(parents=True, exist_ok=True)
+    scrub_file.write_text("print('wiped by an out-of-band reset')", encoding="utf-8")
+
+    result = enforce_snapshot_scrub(root)
+    assert result is True, "exact-match pinned blob must restore and report True"
+    assert snapshot_scrub_problems(root) == [], (
+        "scrub file was not actually repaired on disk")
+
+    marker = json.loads(_marker_path().read_text(encoding="utf-8"))
+    assert marker["missing"] is True, (
+        "evidence path must still record the incident even on restore success")
+    assert marker["auto_restored"] is True
+    assert len(marker["reasons"]) == len(SENTINELS)
+    _heal_marker()
+
+
+def test_pinned_restore_refused_on_hash_mismatch(tmp_path: Path, capsys):
+    """A tampered/stale blob (wrong hash) must NEVER be restored -- fail loud,
+    restore nothing, same detect-only outcome as if no blob existed."""
+    from hermes_cli.post_update_guard import PINNED_BLOB_REL
+
+    root = tmp_path
+    blob_path = root / PINNED_BLOB_REL
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    tampered = _real_pinned_blob_bytes() + b"\n# tampered\n"
+    blob_path.write_bytes(tampered)
+
+    scrub_file = root / SNAPSHOT_SCRUB_REL
+    scrub_file.parent.mkdir(parents=True, exist_ok=True)
+    broken_content = "print('wiped by an out-of-band reset')"
+    scrub_file.write_text(broken_content, encoding="utf-8")
+
+    result = enforce_snapshot_scrub(root)
+    assert result is False, "hash-mismatched blob must never restore"
+    assert scrub_file.read_text(encoding="utf-8") == broken_content, (
+        "scrub file must be untouched when the pinned blob fails verification")
+
+    captured = capsys.readouterr()
+    assert "AUTO-RESTORE REFUSED" in captured.out
+    assert "hash verification" in captured.out
+
+    marker = json.loads(_marker_path().read_text(encoding="utf-8"))
+    assert marker["auto_restored"] is False
+    assert "hash verification" in marker["auto_restore_detail"]
+    _heal_marker()
+
+
+def test_pinned_restore_refused_on_sentinel_version_drift(
+        tmp_path: Path, monkeypatch, capsys):
+    """Version drift: the pinned blob hash-verifies fine, but the *current*
+    code now requires a sentinel the pin predates. Must fail loud and restore
+    nothing -- restoring would silently reintroduce a tree that still fails
+    the guard, worse than the existing notice (Dave's named concern)."""
+    import hermes_cli.post_update_guard as guard
+    from hermes_cli.post_update_guard import PINNED_BLOB_REL
+
+    root = tmp_path
+    blob_path = root / PINNED_BLOB_REL
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.write_bytes(_real_pinned_blob_bytes())
+
+    scrub_file = root / SNAPSHOT_SCRUB_REL
+    scrub_file.parent.mkdir(parents=True, exist_ok=True)
+    broken_content = "print('wiped by an out-of-band reset')"
+    scrub_file.write_text(broken_content, encoding="utf-8")
+
+    # Simulate a legitimate code change that added a new required sentinel
+    # the committed blob does not carry yet.
+    monkeypatch.setattr(
+        guard, "SENTINELS",
+        (*guard.SENTINELS, "_A_BRAND_NEW_SENTINEL_NOT_IN_THE_PIN"))
+
+    result = enforce_snapshot_scrub(root)
+    assert result is False, "version-drifted blob must never restore"
+    assert scrub_file.read_text(encoding="utf-8") == broken_content, (
+        "scrub file must be untouched on version-drift refusal")
+
+    captured = capsys.readouterr()
+    assert "AUTO-RESTORE REFUSED" in captured.out
+    assert "version drift" in captured.out.lower()
+
+    marker = json.loads(_marker_path().read_text(encoding="utf-8"))
+    assert marker["auto_restored"] is False
+    assert "drift" in marker["auto_restore_detail"].lower()
+    _heal_marker()
+
+
+def test_pinned_restore_refused_when_blob_missing(tmp_path: Path):
+    """No pinned blob file at all (e.g. fresh/partial install) => refuse
+    loudly, identical detect-only behaviour to before Option 2 existed."""
+    root = tmp_path
+    scrub_file = root / SNAPSHOT_SCRUB_REL
+    scrub_file.parent.mkdir(parents=True, exist_ok=True)
+    scrub_file.write_text("print('no guard, no blob')", encoding="utf-8")
+
+    result = enforce_snapshot_scrub(root)
+    assert result is False
+    marker = json.loads(_marker_path().read_text(encoding="utf-8"))
+    assert marker["auto_restored"] is False
+    assert "not found" in marker["auto_restore_detail"]
+    _heal_marker()
+
+
+def test_origin_is_pinned_to_fork_not_official_repo():
+    """F-2 tripwire (Viktor review finding, Low, CWE-353): the live checkout's
+    `origin` must point at a fork, never back at an OFFICIAL_REPO_URLS entry.
+
+    The existing reset-simulation regression
+    (test_checkout_reset_to_origin_main_keeps_scrub_sentinels) clones the
+    LOCAL repo, so it cannot catch the exact historical recurrence vector:
+    someone re-pointing `origin` back at the official upstream repo, after
+    which the very next `hermes update` reset would land on an unscrubbed
+    tree again. This test asserts directly against the live remote config.
+    """
+    from hermes_cli.update_cmd_git import (
+        OFFICIAL_REPO_URLS,
+        _get_origin_url,
+        _is_fork,
+    )
+
+    repo_root = sanitise_path(Path(__file__).resolve().parents[2])
+    origin_url = _get_origin_url(["git"], repo_root)
+    assert origin_url, "live checkout has no 'origin' remote configured"
+    assert _is_fork(origin_url) is True, (
+        f"origin ({origin_url!r}) must be a fork, not an official repo URL "
+        f"({OFFICIAL_REPO_URLS}) -- a re-pointed origin is the exact "
+        "historical recurrence vector for the CWE-312 scrub wipe")
