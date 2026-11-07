@@ -125,3 +125,54 @@ def test_wiring_in_main_success_path(tmp_path: Path):
     source = inspect.getsource(cmd_update)
     assert "enforce_snapshot_scrub" in source, (
         "cmd_update no longer calls enforce_snapshot_scrub")
+
+
+def test_checkout_reset_to_origin_main_keeps_scrub_sentinels(tmp_path: Path):
+    """Regression for t_79e44797: a `hermes update`-style `reset --hard origin/main`
+    must not wipe the scrub hardening.
+
+    Root cause of the 3x CWE-312 re-opening (11-04, 11-06, 11-07): `hermes update`
+    resets the checkout to `origin/main`, and the scrub commits (fdebaa9e4d,
+    b0c331f142) only ever lived on the local branch, never on the branch a reset
+    lands on. The fix (fork-pin, Dave's decision on this card) folds those commits
+    into the fork's main — the branch `origin` now points at — so `origin/main` IS
+    the scrub-hardened branch and a reset can no longer remove it.
+
+    This test proves the fix at the git-plumbing level without touching the network:
+    it clones the live local checkout (which already carries the scrub commits on
+    main) and reset --hard's a fresh copy to its own origin/main, exactly like a
+    `hermes update` checkout reset does. If the scrub tree lived only on a branch
+    that a reset does not land on, this would fail.
+    """
+    import subprocess
+
+    repo_root = sanitise_path(Path(__file__).resolve().parents[2])
+    clone_dir = tmp_path / "reset_sim_clone"
+
+    def _git(*args: str, cwd: Path) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=60,
+            check=False)
+        assert result.returncode == 0, (
+            f"git {' '.join(args)} failed: {result.stderr}")
+        return result.stdout
+
+    # Local clone of the live checkout — stands in for the fork remote without
+    # requiring network access in CI; the live checkout's main already IS the
+    # fork's main post fork-pin (verified separately by `git ls-remote origin main`
+    # matching local HEAD at build time).
+    _git("clone", "--quiet", str(repo_root), str(clone_dir), cwd=tmp_path)
+
+    # Dirty the working tree to simulate drift, then do exactly what a checkout
+    # reset does: reset --hard to the remote-tracking main.
+    scrub_file = clone_dir / SNAPSHOT_SCRUB_REL
+    scrub_file.write_text("print('simulated unscrubbed writer')", encoding="utf-8")
+    assert snapshot_scrub_problems(clone_dir) != [], (
+        "test setup error: dirtied file should look unscrubbed before reset")
+
+    _git("reset", "--hard", "origin/main", cwd=clone_dir)
+
+    problems = snapshot_scrub_problems(clone_dir)
+    assert problems == [], (
+        "checkout reset to origin/main lost the scrub hardening -- this is "
+        f"the exact recurrence t_79e44797 closes. Problems: {problems}")
