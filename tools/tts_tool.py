@@ -41,7 +41,7 @@ from tools.tts_command_provider import (
 from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER
 from tools.tts_tool_delivery import (
     _resolve_max_text_length, _build_audio_delivery_files, _convert_to_opus, _remove_quietly,
-    _repair_ogg_container, _resolve_audio_delivery_profile, _split_text_for_tts)
+    _repair_ogg_container, _resolve_audio_delivery_profile, _section, _split_text_for_tts)
 from tools.tts_tool_providers import (
     _generate_edge_tts, _generate_elevenlabs, _generate_gemini_tts, _generate_minimax_tts,
     _generate_mistral_tts, _generate_xai_tts, _resolve_minimax_tts_runtime)
@@ -50,6 +50,7 @@ from tools.tts_tool_plugins import (
     _dispatch_to_plugin_provider, _plugin_provider_is_available,
     _plugin_provider_is_voice_compatible)
 from tools.tts_tool_openai import _generate_deepinfra_tts, _generate_openai_tts, _has_openai_audio_backend
+from tools.tts_tool_openai_realtime import _generate_openai_realtime_tts
 
 
 _PM_FEATURE_ALIASES = {"tts.edge": "edge-tts", "tts.elevenlabs": "tts-premium", "tts.mistral": "mistral"}
@@ -233,7 +234,10 @@ def _synthesize_builtin(engine: str, text: str, file_str: str, tts_config: dict[
     if entry is None:
         _run_edge_tts(text, file_str, tts_config)
     elif engine == "openai":
-        _generate_openai_tts(text, file_str, tts_config, instructions=instructions)
+        if _section(tts_config, "openai").get("api") == "realtime":
+            _generate_openai_realtime_tts(text, file_str, tts_config, instructions=instructions)
+        else:
+            _generate_openai_tts(text, file_str, tts_config, instructions=instructions)
     else:
         globals()[entry[2]](text, file_str, tts_config)
 
