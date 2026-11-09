@@ -17,10 +17,13 @@ import logging
 import threading
 import time
 from typing import Any, Optional
+from urllib.parse import urlparse
 
+from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER, read_selection
 from tools.tts_tool_delivery import _origin, _section, _wrap_pcm_as_wav, _write_wav_bytes_as
 from tools.tts_tool_openai import _resolve_openai_audio_client_config
-from tools.tts_tool_providers import _tts_response_format_from_path
+from tools.tts_tool_providers import _scrub_secret_text, _tts_response_format_from_path
 
 logger = logging.getLogger("tools.tts_tool")
 
@@ -30,6 +33,27 @@ DEFAULT_OPENAI_REALTIME_MODEL = "gpt-realtime-2.1-mini"
 # existing _wrap_pcm_as_wav()/_write_wav_bytes_as() container pipeline is reused unmodified.
 _REALTIME_AUDIO_FORMAT = {"type": "audio/pcm", "rate": 24000}
 DEFAULT_REALTIME_TIMEOUT_S = 30.0
+
+
+def _base_url_is_managed_gateway_origin(effective_base_url: Optional[str]) -> bool:
+    """True when *effective_base_url* resolves to the managed Nous ``openai-audio`` gateway's
+    origin (scheme+host[:port]), regardless of path/trailing slash. F-2 (CWE-693): a direct API
+    key pointed at the gateway's own origin must be caught the same as the resolver's
+    ``is_managed`` flag -- the gateway's speech route silently coerces unsupported models, and a
+    v1/realtime WS aimed at it is unproven, so this shape must reject exactly like the managed
+    selection does.
+    """
+    if not effective_base_url:
+        return False
+    gateway = resolve_managed_tool_gateway("openai-audio")
+    if gateway is None or not gateway.gateway_origin:
+        return False
+    try:
+        requested = urlparse(effective_base_url)
+        managed = urlparse(gateway.gateway_origin)
+    except ValueError:
+        return False
+    return bool(requested.netloc) and (requested.scheme, requested.netloc) == (managed.scheme, managed.netloc)
 
 
 def _generate_openai_realtime_tts(
@@ -50,23 +74,28 @@ def _generate_openai_realtime_tts(
     is_managed = False
     if api_key is None:
         api_key, fallback_base, is_managed = _resolve_openai_audio_client_config()
-    if is_managed:
-        # F-2 managed-gateway interaction (plan Task 1 AC3): the managed Nous audio proxy is not
-        # proven to proxy v1/realtime WebSocket sessions. Reject explicitly -- never silently
-        # coerce back to the old speech model/endpoint, and never send a request over this route.
+    oai_config = _section(tts_config, "openai")
+    config_base_url = oai_config.get("base_url")
+    effective_base_url = base_url or config_base_url or fallback_base or "https://api.openai.com/v1"
+    # F-2 (CWE-693): reject on ANY of the resolver's is_managed flag, the raw "tts" selection
+    # being the managed row, or the effective base_url pointing at the managed gateway's own
+    # origin -- independent of how the credential got here. The explicit-api_key kwarg (sole call
+    # site never passes one; tests enshrine the skip) used to bypass this guard entirely by
+    # skipping resolution, and a gateway-origin base_url + a direct key resolved as "not managed"
+    # even though it still aims an unproven v1/realtime session at the gateway, which silently
+    # coerces unsupported models on its speech route. Raised before any client is constructed.
+    if (is_managed or read_selection("tts") == NOUS_MANAGED_PROVIDER
+            or _base_url_is_managed_gateway_origin(effective_base_url)):
         raise ValueError(
             "tts.openai.api='realtime' is not supported through the managed Nous audio gateway "
             "(not proven to proxy v1/realtime WebSocket sessions). Set tts.openai.api_key or "
             "VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY to use the Realtime backend directly, or leave "
             "tts.openai.api unset/'speech' to keep using the managed gateway.")
-    oai_config = _section(tts_config, "openai")
     if model is None:
         model = oai_config.get("realtime_model", DEFAULT_OPENAI_REALTIME_MODEL)
     if voice is None:
         voice = oai_config.get("voice") or "alloy"
-    config_base_url = oai_config.get("base_url")
-    if base_url is None:
-        base_url = config_base_url or fallback_base or "https://api.openai.com/v1"
+    base_url = effective_base_url
     if speed is None:
         speed_default = tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0
         speed = float(oai_config.get("speed", speed_default))
@@ -99,7 +128,7 @@ def _generate_openai_realtime_tts(
                     if etype == "response.done":
                         return
         except Exception as exc:  # connection dropped / parse failure mid-stream
-            error_holder.append(f"{type(exc).__name__}: {exc}")
+            error_holder.append(_scrub_secret_text(f"{type(exc).__name__}: {exc}", api_key))
             done_event.set()
 
     try:
@@ -118,7 +147,7 @@ def _generate_openai_realtime_tts(
                 "type": "message", "role": "user",
                 "content": [{"type": "input_text", "text": text}],
             })
-            connection.response.create(response={"modalities": ["audio"]})
+            connection.response.create(response={"output_modalities": ["audio"]})
             pump_thread = threading.Thread(target=_pump, args=(connection,), daemon=True)
             pump_thread.start()
             done_event.wait(timeout=timeout_s)
@@ -127,7 +156,9 @@ def _generate_openai_realtime_tts(
             # thread exits promptly; bound the join so a wedged thread can never hang this call.
             pump_thread.join(timeout=2.0)
     except Exception as exc:
-        raise ValueError(f"OpenAI Realtime TTS session failed: {type(exc).__name__}: {exc}") from exc
+        raise ValueError(
+            _scrub_secret_text(f"OpenAI Realtime TTS session failed: {type(exc).__name__}: {exc}", api_key)
+        ) from exc
     finally:
         close = getattr(client, "close", None)
         if callable(close):
@@ -140,7 +171,7 @@ def _generate_openai_realtime_tts(
             f"OpenAI Realtime TTS timed out after {timeout_s:.0f}s waiting for a response "
             "(no file written; increase tts.openai.realtime_timeout_s if this recurs).")
     if error_holder:
-        raise ValueError(f"OpenAI Realtime TTS error: {error_holder[0]}")
+        raise ValueError(_scrub_secret_text(f"OpenAI Realtime TTS error: {error_holder[0]}", api_key))
     if not audio_chunks:
         raise ValueError("OpenAI Realtime TTS returned no audio data")
 

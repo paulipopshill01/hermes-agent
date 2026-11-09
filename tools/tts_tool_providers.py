@@ -25,6 +25,32 @@ from tools.xai_http import hermes_xai_user_agent
 
 logger = logging.getLogger("tools.tts_tool")
 
+# Secret-shaped substrings to redact from exception text before it's embedded in a raised
+# ValueError or an error envelope (CWE-209/CWE-532 defense-in-depth): an OpenAI-style API key
+# literal, wherever one might end up reflected into a caught exception's str().
+_SECRET_SHAPED_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
+_SCRUBBED_TEXT_MAX_LEN = 200
+_REDACTED_MARKER = "***REDACTED***"
+
+
+def _scrub_secret_text(text: object, *known_secrets: Optional[str], max_len: int = _SCRUBBED_TEXT_MAX_LEN) -> str:
+    """Redact secret-shaped substrings and any supplied known secret value, then cap length.
+
+    Defense-in-depth for exception text embedded in a raised error (never relied on as the sole
+    protection against a key riding an exception's ``str()`` -- the real safeguard is keeping
+    credentials out of request paths that could surface them). Applied before any caller logs or
+    raises *text*, so a secret can't survive truncation by being pushed past the cap.
+    """
+    scrubbed = str(text)
+    for secret in known_secrets:
+        if secret:
+            scrubbed = scrubbed.replace(secret, _REDACTED_MARKER)
+    scrubbed = _SECRET_SHAPED_PATTERN.sub(_REDACTED_MARKER, scrubbed)
+    if len(scrubbed) > max_len:
+        scrubbed = scrubbed[:max_len] + "...[truncated]"
+    return scrubbed
+
+
 DEFAULT_EDGE_VOICE = "en-US-AriaNeural"
 DEFAULT_ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
 DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"

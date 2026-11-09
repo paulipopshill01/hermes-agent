@@ -44,7 +44,7 @@ from tools.tts_tool_delivery import (
     _repair_ogg_container, _resolve_audio_delivery_profile, _section, _split_text_for_tts)
 from tools.tts_tool_providers import (
     _generate_edge_tts, _generate_elevenlabs, _generate_gemini_tts, _generate_minimax_tts,
-    _generate_mistral_tts, _generate_xai_tts, _resolve_minimax_tts_runtime)
+    _generate_mistral_tts, _generate_xai_tts, _resolve_minimax_tts_runtime, _scrub_secret_text)
 from tools.tts_tool_local import _generate_kittentts, _generate_neutts, _generate_piper_tts
 from tools.tts_tool_plugins import (
     _dispatch_to_plugin_provider, _plugin_provider_is_available,
@@ -410,8 +410,14 @@ def _media_tag(paths: list[str], voice_compatible: bool) -> str:
 
 
 def _tool_failure(prefix: str, provider: str, exc: BaseException) -> str:
-    """Log and wrap a synthesis failure as the standard error envelope (traceback except for config errors)."""
-    error_msg = f"{prefix} ({provider}): {exc}"
+    """Log and wrap a synthesis failure as the standard error envelope (traceback except for config errors).
+
+    F-1 (CWE-209/CWE-532): ``exc``'s text is scrubbed of secret-shaped substrings and capped before
+    it's embedded in the returned envelope -- this path is provider-generic (no single resolved
+    credential value in scope here), so it relies on the shape-based redaction only; providers that
+    do have a resolved key in scope additionally scrub that literal value at the raise site.
+    """
+    error_msg = f"{prefix} ({provider}): {_scrub_secret_text(str(exc))}"
     logger.error("%s", error_msg, exc_info=not isinstance(exc, ValueError))
     return tool_error(error_msg, success=False)
 

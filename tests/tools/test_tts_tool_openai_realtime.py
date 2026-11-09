@@ -284,3 +284,135 @@ class TestCredentialChainReused:
                 "Hi", str(tmp_path / "out.wav"), {"openai": {}}, api_key="explicit-key")
 
         assert resolver_called["value"] is False
+
+
+class TestManagedGuardPredicateBroadened:
+    """F-2 (CWE-693): the rejection must fire on any of the three adjacent shapes, not just the
+    resolver's ``is_managed`` flag -- and must still raise before any client is constructed."""
+
+    def test_explicit_api_key_does_not_bypass_nous_selection(self, tmp_path, monkeypatch):
+        """An explicit api_key kwarg used to skip resolution (and so the old is_managed-only
+        guard) entirely. The persisted "tts" selection being the managed row must still reject."""
+        monkeypatch.setattr(
+            "tools.tts_tool_openai_realtime.read_selection", lambda section: "nous")
+        connect_was_called = {"value": False}
+
+        def _poison_client(**kw):
+            connect_was_called["value"] = True
+            raise AssertionError("must never construct a client for a rejected managed request")
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = _poison_client
+            with pytest.raises(ValueError, match="managed Nous audio gateway"):
+                _generate_openai_realtime_tts(
+                    "Hi", str(tmp_path / "out.wav"), {"openai": {}}, api_key="explicit-key")
+        assert connect_was_called["value"] is False
+
+    def test_direct_key_at_gateway_origin_base_url_rejected(self, tmp_path, monkeypatch):
+        """A direct API key + ``tts.openai.base_url`` pointed at the managed gateway's own origin
+        resolves as non-managed (resolver never consulted) but must still be rejected: the
+        gateway's speech route silently coerces unsupported models, and v1/realtime WS support
+        through it is unproven."""
+        from tools.managed_tool_gateway import ManagedToolGatewayConfig
+
+        monkeypatch.setattr(
+            "tools.tts_tool_openai_realtime.resolve_managed_tool_gateway",
+            lambda vendor: ManagedToolGatewayConfig(
+                vendor=vendor, gateway_origin="https://openai-audio-gateway.nousresearch.com",
+                nous_user_token="nous-token", managed_mode=True))
+        connect_was_called = {"value": False}
+
+        def _poison_client(**kw):
+            connect_was_called["value"] = True
+            raise AssertionError("must never construct a client for a rejected managed request")
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = _poison_client
+            with pytest.raises(ValueError, match="managed Nous audio gateway"):
+                _generate_openai_realtime_tts(
+                    "Hi", str(tmp_path / "out.wav"),
+                    {"openai": {"base_url": "https://openai-audio-gateway.nousresearch.com/v1"}},
+                    api_key="sk-direct-key-not-managed")
+        assert connect_was_called["value"] is False
+
+    def test_direct_key_at_unrelated_base_url_still_allowed(self, tmp_path, monkeypatch):
+        """Negative control: a direct key against a base_url that is NOT the managed gateway's
+        origin must still go through -- the broadened predicate must not over-reject."""
+        from tools.managed_tool_gateway import ManagedToolGatewayConfig
+
+        monkeypatch.setattr(
+            "tools.tts_tool_openai_realtime.resolve_managed_tool_gateway",
+            lambda vendor: ManagedToolGatewayConfig(
+                vendor=vendor, gateway_origin="https://openai-audio-gateway.nousresearch.com",
+                nous_user_token="nous-token", managed_mode=True))
+        monkeypatch.setattr("tools.tts_tool_openai_realtime.read_selection", lambda section: None)
+        events = [_event("response.output_audio.delta", delta=_b64(b"\x00\x00" * 50)),
+                   _event("response.done")]
+        conn_cm = _FakeConnectionCM(events)
+        client = _fake_client(conn_cm)
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = lambda **kw: client
+            result = _generate_openai_realtime_tts(
+                "Hi", str(tmp_path / "out.wav"),
+                {"openai": {"base_url": "https://api.openai.com/v1"}},
+                api_key="sk-direct-key-not-managed")
+        assert result == str(tmp_path / "out.wav")
+
+
+class TestExceptionTextScrubbed:
+    """F-1 (CWE-209/CWE-532): secret-shaped substrings and the resolved key's literal value must
+    never survive into a raised ValueError's text, and the embedded text is capped at ~200 chars.
+    Distinct from ``test_connect_failure_raises_value_error_not_leaked_raw`` above, whose fixture
+    is already pre-redacted -- these fixtures carry a live secret-shaped string in ``str(exc)``."""
+
+    def test_connect_failure_scrubs_secret_shaped_and_resolved_key(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "tools.tts_tool_openai_realtime._resolve_openai_audio_client_config",
+            lambda: ("sk-resolved-secret-0123456789", "https://api.openai.com/v1", False))
+        live_key = "sk-resolved-secret-0123456789"
+        conn_cm = _FakeConnectionCM(raise_on_enter=RuntimeError(f"401 Unauthorized: key={live_key}"))
+        client = _fake_client(conn_cm)
+        output_path = str(tmp_path / "out.wav")
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = lambda **kw: client
+            with pytest.raises(ValueError) as excinfo:
+                _generate_openai_realtime_tts("Hi", output_path, {"openai": {}})
+
+        message = str(excinfo.value)
+        assert live_key not in message
+        assert "sk-resolved-secret-0123456789" not in message
+        assert "***REDACTED***" in message
+
+    def test_pump_exception_scrubs_secret_shaped_text(self, tmp_path):
+        class _BoomIterable:
+            def __iter__(self):
+                raise RuntimeError("socket closed, auth header was Bearer sk-abcdefghijklmnop")
+
+        conn_cm = _FakeConnectionCM()
+        conn_cm._events = _BoomIterable()  # bypass __init__'s list(events) eager consumption
+        client = _fake_client(conn_cm)
+        output_path = str(tmp_path / "out.wav")
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = lambda **kw: client
+            with pytest.raises(ValueError) as excinfo:
+                _generate_openai_realtime_tts("Hi", output_path, {"openai": {}})
+
+        message = str(excinfo.value)
+        assert "sk-abcdefghijklmnop" not in message
+        assert "***REDACTED***" in message
+
+    def test_embedded_exception_text_capped_at_200_chars(self, tmp_path):
+        huge = "x" * 5000
+        conn_cm = _FakeConnectionCM(raise_on_enter=RuntimeError(huge))
+        client = _fake_client(conn_cm)
+        output_path = str(tmp_path / "out.wav")
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = lambda **kw: client
+            with pytest.raises(ValueError) as excinfo:
+                _generate_openai_realtime_tts("Hi", output_path, {"openai": {}})
+
+        assert len(str(excinfo.value)) < 300  # capped text + the fixed wrapper prefix
