@@ -35,25 +35,69 @@ _REALTIME_AUDIO_FORMAT = {"type": "audio/pcm", "rate": 24000}
 DEFAULT_REALTIME_TIMEOUT_S = 30.0
 
 
+# F-4 (Low, CVSS 3.3, CWE-178): raw (scheme, netloc) equality is bypassed by ordinary URL
+# respellings of the same host -- trailing-dot FQDN, host case, explicit default port, userinfo
+# in netloc -- none of which change what host/port a client actually connects to. ws/wss is the
+# same *transport family* as http/https for this guard's purposes (the Realtime client derives
+# its WebSocket scheme from whatever http(s) base_url it's given), so wss is treated as an alias
+# of https when matching against the gateway's origin. http is deliberately left unaliased to
+# https: RFC 6454 treats a scheme change as a different origin, and collapsing http->https would
+# widen the guard to reject configurations nobody asked it to reject; a bare http:// pointed at
+# the gateway is the same accepted residual as the original F-2 review (fails loudly in practice,
+# not silently).
+_ORIGIN_SCHEME_ALIASES = {"ws": "http", "wss": "https"}
+_ORIGIN_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _normalized_origin_key(url: Optional[str]) -> Optional[tuple[str, str, Optional[int]]]:
+    """(scheme, host, port) key for origin comparison, or ``None`` if *url* has no usable host.
+
+    Normalizes what ``urlparse``'s raw ``(scheme, netloc)`` does not: ``hostname`` already
+    lowercases and strips userinfo, this additionally strips a trailing FQDN dot, lowercases and
+    ws/wss-aliases the scheme, and resolves an omitted port to the scheme's default so an explicit
+    ``:443``/``:80`` compares equal to no port at all.
+    """
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    host = host.rstrip(".")
+    scheme = (parsed.scheme or "").lower()
+    scheme = _ORIGIN_SCHEME_ALIASES.get(scheme, scheme)
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = _ORIGIN_DEFAULT_PORTS.get(scheme)
+    return (scheme, host, port)
+
+
 def _base_url_is_managed_gateway_origin(effective_base_url: Optional[str]) -> bool:
     """True when *effective_base_url* resolves to the managed Nous ``openai-audio`` gateway's
-    origin (scheme+host[:port]), regardless of path/trailing slash. F-2 (CWE-693): a direct API
-    key pointed at the gateway's own origin must be caught the same as the resolver's
+    origin (scheme+host[:port]), regardless of path/trailing slash, host case, trailing-dot FQDN
+    spelling, explicit default port, userinfo, or ws/wss transport aliasing. F-2 (CWE-693): a
+    direct API key pointed at the gateway's own origin must be caught the same as the resolver's
     ``is_managed`` flag -- the gateway's speech route silently coerces unsupported models, and a
     v1/realtime WS aimed at it is unproven, so this shape must reject exactly like the managed
-    selection does.
+    selection does. F-4 (CWE-178): the comparison is normalized (see ``_normalized_origin_key``)
+    so ordinary respellings of the same host can't evade it.
     """
     if not effective_base_url:
         return False
     gateway = resolve_managed_tool_gateway("openai-audio")
     if gateway is None or not gateway.gateway_origin:
         return False
-    try:
-        requested = urlparse(effective_base_url)
-        managed = urlparse(gateway.gateway_origin)
-    except ValueError:
+    requested_key = _normalized_origin_key(effective_base_url)
+    managed_key = _normalized_origin_key(gateway.gateway_origin)
+    if requested_key is None or managed_key is None:
         return False
-    return bool(requested.netloc) and (requested.scheme, requested.netloc) == (managed.scheme, managed.netloc)
+    return requested_key == managed_key
 
 
 def _generate_openai_realtime_tts(

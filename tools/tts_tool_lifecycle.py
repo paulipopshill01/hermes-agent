@@ -26,6 +26,7 @@ from tools.tts_tool_delivery import _origin
 from tools.tts_tool_local import (
     _LOCAL_TTS_MODEL_CACHES, _load_kittentts_model_for_config, _load_piper_voice_for_config)
 from tools.tts_tool_plugins import _lookup_plugin_provider
+from tools.tts_tool_providers import _scrub_secret_text
 
 logger = logging.getLogger("tools.tts_tool")
 
@@ -104,8 +105,9 @@ def warm_tts_provider(tts_config: Optional[dict[str, Any]] = None, provider: Opt
         try:
             warmer(tts_config)
         except Exception as exc:  # engine missing, download failed, bad voice…
-            logger.warning("[TTS] warm-up for %s failed: %s", name, exc)
-            result.update(action="error", error=str(exc))
+            scrubbed_exc = _scrub_secret_text(str(exc))
+            logger.warning("[TTS] warm-up for %s failed: %s", name, scrubbed_exc)
+            result.update(action="error", error=scrubbed_exc)
             return result
         result.update(
             warmed=True, action="loaded" if len(cache) > before else "cached",
@@ -127,8 +129,9 @@ def warm_tts_provider(tts_config: Optional[dict[str, Any]] = None, provider: Opt
                 pm.ensure_import(feature)
                 result.update(warmed=True, action="installed")
         except Exception as exc:
-            logger.debug("[TTS] SDK warm-up for %s skipped: %s", name, exc)
-            result.update(action="error", error=str(exc))
+            scrubbed_exc = _scrub_secret_text(str(exc))
+            logger.debug("[TTS] SDK warm-up for %s skipped: %s", name, scrubbed_exc)
+            result.update(action="error", error=scrubbed_exc)
     return result
 
 

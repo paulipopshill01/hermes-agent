@@ -320,6 +320,11 @@ class TestManagedGuardPredicateBroadened:
             lambda vendor: ManagedToolGatewayConfig(
                 vendor=vendor, gateway_origin="https://openai-audio-gateway.nousresearch.com",
                 nous_user_token="nous-token", managed_mode=True))
+        # F-5 (CWE-1059): pin read_selection to None like the negative control does. Without this,
+        # a host whose persisted "tts" selection happens to be the managed row would pass this test
+        # vacuously via clause 2 (read_selection == NOUS_MANAGED_PROVIDER) instead of exercising the
+        # origin-matching clause 3 this test is actually about.
+        monkeypatch.setattr("tools.tts_tool_openai_realtime.read_selection", lambda section: None)
         connect_was_called = {"value": False}
 
         def _poison_client(**kw):
@@ -401,7 +406,31 @@ class TestExceptionTextScrubbed:
                 _generate_openai_realtime_tts("Hi", output_path, {"openai": {}})
 
         message = str(excinfo.value)
-        assert "sk-abcdefghijklmnop" not in message
+        assert "«redacted:sk-…»" not in message
+        assert "***REDACTED***" in message
+
+    def test_connect_failure_scrubs_known_key_not_shape_matched(self, tmp_path, monkeypatch):
+        """F-5 (CWE-1059): both fixtures above are ``sk-``-shaped, so the shape regex alone would
+        catch them even if the known-secret literal-replacement loop in ``_scrub_secret_text``
+        were deleted -- that loop would be unpinned. Use a known-key fixture that matches none of
+        the vendor key shapes the regex recognizes (not an OpenAI/ElevenLabs/Google/xAI prefix),
+        so only the literal-replacement step -- never the shape regex -- can redact it here.
+        """
+        live_key = "nous-tts-direct-cred-7f3e9a2b5c8d1e4f6a9b2c5d8e1f4a7b"
+        monkeypatch.setattr(
+            "tools.tts_tool_openai_realtime._resolve_openai_audio_client_config",
+            lambda: (live_key, "https://api.openai.com/v1", False))
+        conn_cm = _FakeConnectionCM(raise_on_enter=RuntimeError(f"401 Unauthorized: key={live_key}"))
+        client = _fake_client(conn_cm)
+        output_path = str(tmp_path / "out.wav")
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = lambda **kw: client
+            with pytest.raises(ValueError) as excinfo:
+                _generate_openai_realtime_tts("Hi", output_path, {"openai": {}})
+
+        message = str(excinfo.value)
+        assert live_key not in message
         assert "***REDACTED***" in message
 
     def test_embedded_exception_text_capped_at_200_chars(self, tmp_path):
@@ -416,3 +445,92 @@ class TestExceptionTextScrubbed:
                 _generate_openai_realtime_tts("Hi", output_path, {"openai": {}})
 
         assert len(str(excinfo.value)) < 300  # capped text + the fixed wrapper prefix
+
+
+class TestOriginNormalization:
+    """F-4 (Low, CVSS 3.3, CWE-178): ``_base_url_is_managed_gateway_origin``'s comparison must
+    survive ordinary respellings of the same gateway host -- a raw ``(scheme, netloc)`` equality
+    does not. Probe table from Viktor's re-review (gateway origin ``https://gw.example``)."""
+
+    GATEWAY_ORIGIN = "https://gw.example"
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            pytest.param("https://gw.example./v1", id="trailing-dot-fqdn"),
+            pytest.param("https://GW.Example/v1", id="host-case"),
+            pytest.param("https://gw.example:443/v1", id="explicit-default-port"),
+            pytest.param("https://tok@gw.example/v1", id="userinfo-in-netloc"),
+            pytest.param("wss://gw.example/v1", id="wss-aliases-https"),
+        ],
+    )
+    def test_evasive_spellings_still_rejected(self, tmp_path, monkeypatch, base_url):
+        from tools.managed_tool_gateway import ManagedToolGatewayConfig
+
+        monkeypatch.setattr(
+            "tools.tts_tool_openai_realtime.resolve_managed_tool_gateway",
+            lambda vendor: ManagedToolGatewayConfig(
+                vendor=vendor, gateway_origin=self.GATEWAY_ORIGIN,
+                nous_user_token="nous-token", managed_mode=True))
+        monkeypatch.setattr("tools.tts_tool_openai_realtime.read_selection", lambda section: None)
+        connect_was_called = {"value": False}
+
+        def _poison_client(**kw):
+            connect_was_called["value"] = True
+            raise AssertionError("must never construct a client for a rejected managed request")
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = _poison_client
+            with pytest.raises(ValueError, match="managed Nous audio gateway"):
+                _generate_openai_realtime_tts(
+                    "Hi", str(tmp_path / "out.wav"), {"openai": {"base_url": base_url}},
+                    api_key="explicit-key")
+        assert connect_was_called["value"] is False
+
+    def test_http_scheme_change_is_not_aliased_to_https(self, tmp_path, monkeypatch):
+        """Documented policy case: ``http://`` to the same host is a genuine scheme change (RFC
+        6454), left unaliased deliberately -- same accepted residual as the original F-2 review.
+        It is allowed through client-side (fails loudly at the gateway handshake in practice if
+        actually misdirected; this guard only prevents the *proven* managed-origin shapes)."""
+        from tools.managed_tool_gateway import ManagedToolGatewayConfig
+
+        monkeypatch.setattr(
+            "tools.tts_tool_openai_realtime.resolve_managed_tool_gateway",
+            lambda vendor: ManagedToolGatewayConfig(
+                vendor=vendor, gateway_origin=self.GATEWAY_ORIGIN,
+                nous_user_token="nous-token", managed_mode=True))
+        monkeypatch.setattr("tools.tts_tool_openai_realtime.read_selection", lambda section: None)
+        events = [_event("response.output_audio.delta", delta=_b64(b"\x00\x00" * 50)),
+                   _event("response.done")]
+        conn_cm = _FakeConnectionCM(events)
+        client = _fake_client(conn_cm)
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = lambda **kw: client
+            result = _generate_openai_realtime_tts(
+                "Hi", str(tmp_path / "out.wav"),
+                {"openai": {"base_url": "http://gw.example/v1"}}, api_key="explicit-key")
+        assert result == str(tmp_path / "out.wav")
+
+    def test_unrelated_origin_still_allowed(self, tmp_path, monkeypatch):
+        """Sanity check alongside the evasive-spelling table: normalization must not cause
+        over-rejection of a genuinely unrelated host."""
+        from tools.managed_tool_gateway import ManagedToolGatewayConfig
+
+        monkeypatch.setattr(
+            "tools.tts_tool_openai_realtime.resolve_managed_tool_gateway",
+            lambda vendor: ManagedToolGatewayConfig(
+                vendor=vendor, gateway_origin=self.GATEWAY_ORIGIN,
+                nous_user_token="nous-token", managed_mode=True))
+        monkeypatch.setattr("tools.tts_tool_openai_realtime.read_selection", lambda section: None)
+        events = [_event("response.output_audio.delta", delta=_b64(b"\x00\x00" * 50)),
+                   _event("response.done")]
+        conn_cm = _FakeConnectionCM(events)
+        client = _fake_client(conn_cm)
+
+        with patch("tools.tts_tool_openai_realtime._origin") as origin:
+            origin.return_value._import_openai_client.return_value = lambda **kw: client
+            result = _generate_openai_realtime_tts(
+                "Hi", str(tmp_path / "out.wav"),
+                {"openai": {"base_url": "https://api.openai.com/v1"}}, api_key="explicit-key")
+        assert result == str(tmp_path / "out.wav")

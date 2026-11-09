@@ -26,9 +26,18 @@ from tools.xai_http import hermes_xai_user_agent
 logger = logging.getLogger("tools.tts_tool")
 
 # Secret-shaped substrings to redact from exception text before it's embedded in a raised
-# ValueError or an error envelope (CWE-209/CWE-532 defense-in-depth): an OpenAI-style API key
-# literal, wherever one might end up reflected into a caught exception's str().
-_SECRET_SHAPED_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
+# ValueError or an error envelope (CWE-209/CWE-532 defense-in-depth): vendor API key literals,
+# wherever one might end up reflected into a caught exception's str(). F-6 (CWE-209): shape-only
+# redaction originally covered OpenAI's "sk-" prefix only; broadened (cheaply, no API calls
+# needed) to the other vendor key shapes this module's providers actually use -- ElevenLabs
+# ("sk_" + hex), Google/Gemini ("AIza..."), and xAI ("xai-...") -- so a key that leaks into an
+# exception's text without ever being a known literal in scope still gets caught by shape alone.
+_SECRET_SHAPED_PATTERN = re.compile(
+    r"sk-[A-Za-z0-9_-]{8,}"       # OpenAI-style
+    r"|sk_[A-Za-z0-9]{16,}"       # ElevenLabs-style
+    r"|AIza[A-Za-z0-9_-]{10,}"    # Google/Gemini-style
+    r"|xai-[A-Za-z0-9]{8,}"       # xAI-style
+)
 _SCRUBBED_TEXT_MAX_LEN = 200
 _REDACTED_MARKER = "***REDACTED***"
 
