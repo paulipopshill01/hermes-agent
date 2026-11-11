@@ -706,6 +706,13 @@ override-dependencies = [
   # (CIMultiDict items-view union/subtraction C-ext reference leak, DoS
   # via unbounded memory growth), fixed 6.9.1.
   "multidict>=6.9.1",
+  # msgpack <- fal-client (fal extra). GHSA-j586-36cw-2gc2 / CVE-2026-114613
+  # (unbounded memory leak in the msgpack C extension on strict_map_key
+  # validation failure; DoS via unbounded process memory growth on repeated
+  # malformed inputs), fixed 1.2.3. Card t_e576a523: lock-resolved via the
+  # fal extra even though that extra is not currently materialized in the
+  # installed set — pin it anyway so the floor holds the moment it is.
+  "msgpack>=1.2.3",
 ]
 # Release-age check: Hermes's dependencies must be at least 3 days old when Hermes
 # locks them. It runs where uv.lock is resolved (`hermes pm lock`, and CI's lock
