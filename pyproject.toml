@@ -685,6 +685,27 @@ override-dependencies = [
   # never builds a misaki G2P. The never-true marker removes it from the lock.
   # Remove this line when misaki drops it or a 3.14-capable release fits.
   "spacy-curated-transformers; sys_platform == 'never'",
+  # Pin-bump backlog, repeat x8 across sweeps 10-29 through 11-08
+  # (most recently vps-sweep-20261108.md Finding 1): four transitive
+  # advisory packages that kept re-resolving below floor on every
+  # generation roll because the fix was only ever recommended, never
+  # committed. filelock/oauthlib/multidict floors already proven
+  # vulnerability-free in the separate tooling-venv remediation
+  # (t_bddd8259 family); tornado>=6.6 is net-new here, vetted against
+  # python-telegram-bot 22.8's live functionality post-bump.
+  # filelock <- huggingface-hub, torch. CVE-2026-112939 (sticky-marker
+  # stale-lock forging) floor is 4.2.1; 4.2.9 keeps the tooling-venv-proven pin.
+  "filelock>=4.2.9",
+  # tornado <- python-telegram-bot 22.8. CVE-2026-116577 (obsolete
+  # line-folding header-parser quadratic CPU DoS), fixed 6.6.
+  "tornado>=6.6",
+  # oauthlib <- requests-oauthlib. CVE-2026-49272 (device-code bearer
+  # token retrievable with only a valid client ID), fixed 4.0.1.
+  "oauthlib>=4.0.1",
+  # multidict <- aiohttp, grpclib, yarl. CVE-2026-104874 / PYSEC-2026-4244
+  # (CIMultiDict items-view union/subtraction C-ext reference leak, DoS
+  # via unbounded memory growth), fixed 6.9.1.
+  "multidict>=6.9.1",
 ]
 # Release-age check: Hermes's dependencies must be at least 3 days old when Hermes
 # locks them. It runs where uv.lock is resolved (`hermes pm lock`, and CI's lock
