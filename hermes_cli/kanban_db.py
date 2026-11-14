@@ -3783,6 +3783,7 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    run_id: Optional[int] = None, source: str = "system",
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
@@ -3825,7 +3826,7 @@ def specify_triage_task(
             _insert_comment(
                 conn, task_id, author.strip(),
                 "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
-                int(time.time()),
+                int(time.time()), run_id=run_id, source=source,
             )
         _append_event(
             conn, task_id, "specified",

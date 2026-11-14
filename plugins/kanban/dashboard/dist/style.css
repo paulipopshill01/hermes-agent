@@ -561,6 +561,18 @@
 .hermes-kanban-comment-ago {
   color: var(--color-muted-foreground);
 }
+.hermes-kanban-comment-outofband {
+  /* R-5 (security review t_bd48901c): cheap visual flag for a comment with
+     no bound dispatcher run (F-1b) — same honest "no run provenance" signal
+     CLI show / build_worker_context already render, just surfaced in the UI. */
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 0 0.35rem;
+  border-radius: 0.25rem;
+  border: 1px solid var(--color-muted-foreground);
+  color: var(--color-muted-foreground);
+}
 
 .hermes-kanban-event {
   display: flex;

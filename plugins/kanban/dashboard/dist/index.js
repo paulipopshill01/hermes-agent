@@ -4147,8 +4147,16 @@
               return h("div", { key: c.id, className: "hermes-kanban-comment" },
                 h("div", { className: "hermes-kanban-comment-head" },
                   h("span", { className: "hermes-kanban-comment-author" }, c.author || "anon"),
+                  // R-5 (security review t_bd48901c): surface the F-1b run-provenance
+                  // marker in the UI, not just CLI show / build_worker_context — a
+                  // NULL run_id means no dispatcher run was active when this was
+                  // written (out-of-band), same signal workers already weigh.
+                  c.run_id == null
+                    ? h("span", { className: "hermes-kanban-comment-outofband", title: tx(i18n, "outOfBandTitle", "No run was active when this comment was written") },
+                        tx(i18n, "outOfBand", "out-of-band"))
+                    : null,
                   h("span", { className: "hermes-kanban-comment-ago" },
-                    timeAgo ? timeAgo(c.created_at) : ""),
+                    timeAgo ? timeAgo(c.created_at) : "")
                 ),
                 h(MarkdownBlock, { source: c.body, enabled: props.renderMarkdown }),
               );

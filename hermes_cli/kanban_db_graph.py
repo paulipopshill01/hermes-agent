@@ -90,6 +90,7 @@ def _validate_children_graph(children: list) -> None:
 def decompose_triage_task(
     conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
     author: Optional[str] = None, auto_promote: bool = True,
+    run_id: Optional[int] = None, source: str = "system",
 ) -> Optional[list[str]]:
     """Fan a triage task out into children and move the root to ``todo``; the root
     waits on every child and wakes (``ready``) when all are done.
@@ -154,7 +155,7 @@ def decompose_triage_task(
                 conn, task_id, author.strip(),
                 "Decomposed into " + ", ".join(child_ids)
                 + ". Root will wake when all children complete.",
-                now,
+                now, run_id=run_id, source=source,
             )
         _append_event(
             conn, task_id, "decomposed", {"child_ids": child_ids, "root_assignee": root_assignee},

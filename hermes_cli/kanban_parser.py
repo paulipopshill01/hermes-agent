@@ -68,8 +68,11 @@ def _triage_sweep_args(verb: str, Verb: str, noun: str):
         _arg("task_id", nargs="?", help=f"Task id to {verb} (required unless --all is given)"),
         _arg("--all", dest="all_triage", action="store_true", help=f"{Verb} every task currently in the triage column"),
         _arg("--tenant", help="When used with --all, restrict the sweep to this tenant"),
-        _arg("--author",
-             help=f"Author name recorded on the audit comment (default: $HERMES_PROFILE or '{noun}')"),
+        # No --author: the audit comment's author is always the caller's own
+        # resolved profile identity (R-2, security review t_bd48901c) — same
+        # treatment as `comment`/`attach` (F-1a, 49166fbda2). A free-text
+        # override is an authorship-forgery vector since these comments are
+        # injected into future workers' prompts.
         _json_flag(help="Emit one JSON object per task on stdout"),
     )
 
@@ -185,7 +188,11 @@ _SPECS = [
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
                   "SIGKILLs) the worker and re-queues the task."),
-        _arg("--created-by", default="user", help="Author name recorded on the task (default: user)"),
+        # No --created-by: tasks.created_by is always the caller's own
+        # resolved profile identity (R-3, security review t_bd48901c) — a
+        # free-text override here fed blackboard/audit comment authorship
+        # (kanban_swarm.post_blackboard_update) injected into worker context,
+        # same forgery class as F-1a's --author on comment/attach.
         _arg("--skill", action="append", default=[], dest="skills",
              help="Skill to force-load into the worker (repeatable). The kanban "
                   "lifecycle is already injected automatically. Example: --skill "
@@ -227,7 +234,8 @@ _SPECS = [
         _arg("--synthesizer", required=True, help="Synthesizer/writer profile"),
         _TENANT,
         _PRIORITY,
-        _arg("--created-by", help="Creator/anchor profile"),
+        # No --created-by: see the `create` command's note (R-3) — always the
+        # caller's resolved profile identity, never free text.
         _arg("--idempotency-key", help="Dedup key for the root card"),
         _json_flag(help="Emit JSON output"),
     ], help="Create a Kanban Swarm v1 graph (parallel workers → verifier → synthesizer)"),

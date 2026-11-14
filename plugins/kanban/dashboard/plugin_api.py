@@ -120,11 +120,21 @@ def _require(getter: Callable, conn: sqlite3.Connection, ident, label: str):
     return obj
 
 
-def _run_aux(board: Optional[str], module: str, fn: str, task_id: str, author: Optional[str]) -> Any:
+def _run_aux(board: Optional[str], module: str, fn: str, task_id: str) -> Any:
     """Run a slow auxiliary-LLM task helper (``hermes_cli.<module>.<fn>``) with the board pinned;
-    the module is imported lazily so a missing aux client can't break plugin load."""
+    the module is imported lazily so a missing aux client can't break plugin load.
+
+    ``author`` is always the fixed literal ``"dashboard"`` (same convention as the comments
+    endpoint, F-1a/R-2 security review t_bd48901c) — the dashboard has no per-request caller
+    identity, so a caller-supplied author would be an unauthenticated authorship override on
+    comments injected into future workers' prompts. ``source="api"`` records the write path;
+    no run is active for an HTTP-triggered specify/decompose, so ``run_id`` stays NULL (honest
+    "no run provenance", rendered as such everywhere the resulting audit comment surfaces).
+    """
     def _run():
-        return getattr(importlib.import_module(f"hermes_cli.{module}"), fn)(task_id, author=(author or None))
+        return getattr(importlib.import_module(f"hermes_cli.{module}"), fn)(
+            task_id, author="dashboard", run_id=None, source="api",
+        )
     return _with_board_pinned(board, _run)
 
 
@@ -1022,17 +1032,17 @@ def reclaim_task_endpoint(task_id: str, payload: ReclaimBody, board: Optional[st
 
 
 class SpecifyBody(BaseModel):
-    """Only the author is configurable; model + prompt come from
-    ``auxiliary.triage_specifier`` in config.yaml, same as the CLI."""
-
-    author: Optional[str] = None
+    """No configurable fields: the dashboard has no per-request caller identity, so the audit
+    comment's author is always the fixed literal "dashboard" (R-2, security review
+    t_bd48901c) — model + prompt come from ``auxiliary.triage_specifier`` in config.yaml,
+    same as the CLI."""
 
 
 @router.post("/tasks/{task_id}/specify")
 def specify_task_endpoint(task_id: str, payload: SpecifyBody, board: Optional[str] = Query(None)):
     """Flesh out a triage task via the auxiliary LLM (``hermes kanban specify``). Non-OK is NOT
     an HTTP error — the UI renders the reason inline. Sync ``def`` → runs in the threadpool."""
-    outcome = _run_aux(board, "kanban_specify", "specify_task", task_id, payload.author)
+    outcome = _run_aux(board, "kanban_specify", "specify_task", task_id)
     return {"ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason, "new_title": outcome.new_title}
 
 
@@ -1602,14 +1612,14 @@ def auto_describe_profile(profile_name: str, payload: DescribeAutoBody):
 # --- Decompose (built-in decomposer fan-out) ----------------------------------
 
 class DecomposeBody(BaseModel):
-    author: Optional[str] = None
+    """No configurable fields — see ``SpecifyBody`` (R-2, security review t_bd48901c)."""
 
 
 @router.post("/tasks/{task_id}/decompose")
 def decompose_task_endpoint(task_id: str, payload: DecomposeBody, board: Optional[str] = Query(None)):
     """Fan a triage task out into child tasks via the auxiliary LLM (``hermes kanban decompose``).
     Non-OK is NOT an HTTP error. Sync ``def`` → runs in the threadpool."""
-    outcome = _run_aux(board, "kanban_decompose", "decompose_task", task_id, payload.author)
+    outcome = _run_aux(board, "kanban_decompose", "decompose_task", task_id)
     return {
         "ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason,
         "fanout": bool(outcome.fanout), "child_ids": outcome.child_ids or [], "new_title": outcome.new_title}

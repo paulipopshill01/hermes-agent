@@ -218,7 +218,8 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
     )
 
 
-def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str,
+                   run_id: Optional[int] = None, source: str = "cli") -> DecomposeOutcome:
     """``fanout=false``: single-task spec promotion (same effect as specify)."""
     title_val, body_val = _title_body(parsed)
     assignee_val = None
@@ -231,6 +232,7 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
+            run_id=run_id, source=source,
         )
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
@@ -271,7 +273,8 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
     return children, ""
 
 
-def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str,
+                   run_id: Optional[int] = None, source: str = "cli") -> DecomposeOutcome:
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
         return DecomposeOutcome(task_id, False, "decomposer returned fanout=true with empty tasks list")
@@ -287,6 +290,8 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 children=children,
                 author=author,
                 auto_promote=routing.auto_promote,
+                run_id=run_id,
+                source=source,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -304,6 +309,8 @@ def decompose_task(
     task_id: str,
     *,
     author: Optional[str] = None,
+    run_id: Optional[int] = None,
+    source: str = "cli",
     timeout: Optional[int] = None,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
@@ -332,8 +339,8 @@ def decompose_task(
 
     audit_author = author or _profile_author()
     if not parsed.get("fanout"):
-        return _apply_single(task, parsed, routing, audit_author)
-    return _apply_fanout(task_id, parsed, routing, audit_author)
+        return _apply_single(task, parsed, routing, audit_author, run_id=run_id, source=source)
+    return _apply_fanout(task_id, parsed, routing, audit_author, run_id=run_id, source=source)
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

@@ -363,7 +363,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
+            # created_by is always the caller's own resolved identity (R-3,
+            # security review t_bd48901c) — never a caller-supplied override.
+            created_by=_profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
@@ -403,7 +405,10 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         created = ks.create_swarm(
             conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
             synthesizer_assignee=args.synthesizer, tenant=args.tenant,
-            created_by=args.created_by or _profile_author(), priority=args.priority,
+            # created_by is always the caller's own resolved identity (R-3,
+            # security review t_bd48901c): it anchors blackboard comment
+            # authorship (kanban_swarm.post_blackboard_update), never free text.
+            created_by=_profile_author(), priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
         )
     if getattr(args, "json", False):
@@ -1287,7 +1292,12 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
     """Shared driver for ``specify`` / ``decompose``: validate ids (one task id XOR ``--all``), run
     ``run_one(tid, author=...)`` per id, print JSON or human lines, exit code."""
     all_flag = bool(getattr(args, "all_triage", False))
-    author = getattr(args, "author", None) or _profile_author()
+    # Author is ALWAYS the caller's own resolved profile identity — never a
+    # caller-supplied override (R-2, security review t_bd48901c; same
+    # treatment as --author on comment/attach, F-1a/49166fbda2). The audit
+    # comment this writes is injected into future workers' prompts.
+    author = _profile_author()
+    run_id, source = _comment_provenance_for(args.task_id or "")
     want_json = bool(getattr(args, "json", False))
     tenant = getattr(args, "tenant", None)
     if args.task_id and all_flag:
@@ -1307,7 +1317,7 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
 
     ok_count = 0
     for tid in ids:
-        outcome = run_one(tid, author=author)
+        outcome = run_one(tid, author=author, run_id=run_id, source=source)
         if outcome.ok:
             ok_count += 1
         if want_json:

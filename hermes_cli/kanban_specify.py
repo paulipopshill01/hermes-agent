@@ -191,6 +191,8 @@ def specify_task(
     task_id: str,
     *,
     author: Optional[str] = None,
+    run_id: Optional[int] = None,
+    source: str = "cli",
     timeout: Optional[int] = None,
 ) -> SpecifyOutcome:
     """Specify one triage task and promote it to ``todo``. Expected failures
@@ -227,6 +229,8 @@ def specify_task(
             title=new_title,
             body=new_body,
             author=author or _profile_author(),
+            run_id=run_id,
+            source=source,
         )
     if not ok:
         # Race: promoted/archived between our read and the write.

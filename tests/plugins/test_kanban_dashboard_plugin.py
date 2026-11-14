@@ -1067,6 +1067,46 @@ def test_specify_happy_path(client, monkeypatch):
     assert detail["title"] == "Polished"
     assert "**Goal**" in (detail["body"] or "")
 
+    # R-2 (security review t_bd48901c): a caller-supplied ``author`` is
+    # ignored outright — the audit comment is always the fixed "dashboard"
+    # literal, never free text from the request body.
+    with kbc.connect_closing() as conn:
+        comments = kb.list_comments(conn, t["id"])
+    assert comments and comments[0].author == "dashboard"
+    assert all(c.author != "ui-tester" for c in comments)
+
+
+def test_decompose_ignores_caller_supplied_author(client, monkeypatch):
+    """R-2 (security review t_bd48901c): same treatment as specify — the
+    decompose endpoint's audit comment author is always "dashboard"."""
+    import json as jsonlib
+
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "one-liner", "triage": True},
+    ).json()["task"]
+
+    _patch_specifier_response(
+        monkeypatch,
+        content=jsonlib.dumps(
+            {"fanout": False, "title": "Polished", "body": "**Goal**\nDo the thing."}
+        ),
+    )
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/decompose",
+        json={"author": "ui-tester"},
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    with kbc.connect_closing() as conn:
+        comments = kb.list_comments(conn, t["id"])
+    if comments:
+        assert comments[0].author == "dashboard"
+        assert all(c.author != "ui-tester" for c in comments)
+
+
 # ---------------------------------------------------------------------------
 # Aux-LLM endpoints under multiplexed hosting — profile secret scope (#123372)
 # ---------------------------------------------------------------------------
