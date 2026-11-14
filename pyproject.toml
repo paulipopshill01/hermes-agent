@@ -713,6 +713,11 @@ override-dependencies = [
   # fal extra even though that extra is not currently materialized in the
   # installed set — pin it anyway so the floor holds the moment it is.
   "msgpack>=1.2.3",
+  # opentelemetry-api <- opentelemetry-sdk, instrumentation packages.
+  # CVE-2026-126360 / GHSA-mf5v-w3w3-f6cg (TraceContextTextMapPropagator.extract()
+  # quadratic-time regex backtracking on a malformed traceparent value with an
+  # embedded newline; DoS via event-loop CPU exhaustion), fixed 1.45.2.
+  "opentelemetry-api>=1.45.2",
 ]
 # Release-age check: Hermes's dependencies must be at least 3 days old when Hermes
 # locks them. It runs where uv.lock is resolved (`hermes pm lock`, and CI's lock
