@@ -232,6 +232,21 @@ def _own_task_env(task_id: str, var: str) -> Optional[str]:
     """``$var`` only when this worker is scoped to ``task_id``; else None."""
     return os.environ.get(var) if os.environ.get("HERMES_KANBAN_TASK") == task_id else None
 
+def _active_run_id() -> Optional[int]:
+    """This process's dispatcher run id, independent of which task_id a
+    comment targets (cross-task commenting is a legitimate handoff channel —
+    see ``_handle_comment`` — so provenance must not be gated on task_id
+    matching the worker's own ``HERMES_KANBAN_TASK``, unlike ``_worker_run_id``
+    which IS task-scoped for mutation-ownership checks)."""
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not os.environ.get("HERMES_KANBAN_TASK") or not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _worker_run_id(task_id: str) -> Optional[int]:
     """This worker's dispatcher run id when it is scoped to task_id."""
     raw = _own_task_env(task_id, "HERMES_KANBAN_RUN_ID")
@@ -426,7 +441,7 @@ _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
-_COMMENT_FIELDS = ("author", "body", "created_at")
+_COMMENT_FIELDS = ("author", "body", "created_at", "run_id", "source")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
@@ -969,7 +984,10 @@ def _handle_comment(args: dict, **kw) -> str:
     # with what reads as a system directive. See #19713.
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
-        cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        cid = kb.add_comment(
+            conn, tid, author=author, body=str(body),
+            run_id=_active_run_id(), source="run",
+        )
         return _ok(task_id=tid, comment_id=cid)
 
 

@@ -494,7 +494,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if want_json:
         _print_json({
             "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
-            "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
+            "comments": [_obj_dict(c, ("author", "body", "created_at", "run_id", "source", "via")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
         })
@@ -549,7 +549,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         _print_section("Latest summary:", [latest_summary])
     if comments:
         _print_section(f"Comments ({len(comments)}):",
-                       (f"  [{_fmt_ts(c.created_at)}] {c.author}: {c.body}" for c in comments))
+                       (f"  [{_fmt_ts(c.created_at)}] {c.author}"
+                        f"{'' if c.run_id is not None else ' (out-of-band — no run provenance)'}: {c.body}"
+                        for c in comments))
     if events:
         _print_section(f"Events ({len(events)}):", (
             f"  [{_fmt_ts(e.created_at)}]{f' [run {e.run_id}]' if e.run_id else ''} {e.kind}"
@@ -755,9 +757,14 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
-    author = args.author or _profile_author()
+    # Author is ALWAYS the caller's own resolved profile identity — never a
+    # caller-supplied override (F-1a, security review t_f469a059 / #19713):
+    # comments are injected into future workers' prompts and can live-steer a
+    # running one, so a free-text author is an authorship-forgery vector.
+    author = _profile_author()
+    run_id, source = _comment_provenance_for(args.task_id)
     with kbc.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(conn, args.task_id, author, body, run_id=run_id, source=source)
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -774,7 +781,11 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     data = src.read_bytes()
     name = args.name or src.name
     content_type = args.content_type or mimetypes.guess_type(name)[0]
-    uploaded_by = args.author or _profile_author()
+    # ``uploaded_by`` is a metadata label, not an authorship/comment-injection
+    # surface like ``task_comments.author`` — but it is still displayed
+    # attribution, so it gets the same treatment as comments (F-1a): the
+    # caller's own resolved identity, never a free-text override.
+    uploaded_by = _profile_author()
     try:
         with kbc.connect_closing() as conn:
             att_id = kb.store_attachment_bytes(conn, args.task_id, name, data, content_type=content_type,
@@ -823,6 +834,28 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _comment_provenance_for(task_id: str) -> tuple[Optional[int], str]:
+    """``(run_id, source)`` for a CLI ``comment``/future write on ``task_id``.
+
+    ``HERMES_KANBAN_RUN_ID`` is dispatcher-set env, not caller input, so a CLI
+    call made from a dispatched worker's own terminal session (same trust
+    level as the in-worker ``kanban_comment`` tool — this is exactly how the
+    2026-11-14 incident's genuine-but-unbound comment was written) gets real
+    run provenance. Unlike ``_worker_run_id_for`` this does NOT require
+    ``task_id`` to equal the worker's own task — cross-task commenting is a
+    legitimate handoff channel and still deserves provenance. Outside any
+    dispatcher-bound process (a bare interactive/relay shell) this is NULL —
+    an honest "no run was active", not a guess.
+    """
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if os.environ.get("HERMES_KANBAN_TASK") and raw:
+        try:
+            return int(raw), "run"
+        except ValueError:
+            pass
+    return None, "cli"
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):

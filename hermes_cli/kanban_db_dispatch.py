@@ -910,7 +910,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 conn, tid, "dispatcher",
                 "reconciliation: card was 'running' with no valid claim "
                 "(dead/gone worker) — requeued to ready",
-                now,
+                now, run_id=run_id, source="system",
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
             reconciled.append(tid)

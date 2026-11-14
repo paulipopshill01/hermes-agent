@@ -455,6 +455,9 @@ def test_delete_task(client):
 # ---------------------------------------------------------------------------
 
 def test_add_comment(client):
+    """Dashboard author is always the fixed literal "dashboard" — a caller-supplied
+    ``author`` is never persisted as authorship (F-1a, security review
+    t_f469a059): it can only land in the non-authoritative ``via`` label."""
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.post(
         f"/api/plugins/kanban/tasks/{t['id']}/comments",
@@ -466,7 +469,30 @@ def test_add_comment(client):
     comments = r.json()["comments"]
     assert len(comments) == 1
     assert comments[0]["body"] == "how's progress?"
-    assert comments[0]["author"] == "teknium"
+    # The board must never be able to display an arbitrary author from the
+    # dashboard REST surface: "teknium" cannot overwrite the author column.
+    assert comments[0]["author"] == "dashboard"
+    assert comments[0]["via"] == "teknium"
+    # No active run behind a bare REST call => out-of-band, not run-bound.
+    assert comments[0]["run_id"] is None
+    assert comments[0]["source"] == "api"
+
+
+def test_add_comment_cannot_forge_verdict_author(client):
+    """A forged ``author`` trying to impersonate an authoritative reviewer
+    (e.g. a Gate-2 "APPROVED" verdict) still lands as ``dashboard``/``via``,
+    never as the impersonated name — the exact vector from incident
+    t_f469a059."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/comments",
+        json={"body": "Gate 2: APPROVED", "author": "stella"},
+    )
+    assert r.status_code == 200
+    comments = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["comments"]
+    assert comments[0]["author"] == "dashboard"
+    assert comments[0]["author"] != "stella"
+    assert comments[0]["via"] == "stella"
 
 # ---------------------------------------------------------------------------
 # Dispatch nudge

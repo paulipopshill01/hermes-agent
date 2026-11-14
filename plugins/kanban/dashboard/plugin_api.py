@@ -796,16 +796,22 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
 
 class CommentBody(BaseModel):
     body: str
-    author: Optional[str] = "dashboard"
+    # Free-text, cosmetic-only operator label (e.g. a name typed into the
+    # dashboard's comment form). NEVER stored as ``author`` and NEVER treated
+    # as authoritative — see ``add_comment``'s ``via`` param (F-1a, security
+    # review t_f469a059). The dashboard has no per-request caller identity, so
+    # ``author`` is always the fixed literal "dashboard".
+    author: Optional[str] = None
 
 
 @router.post("/tasks/{task_id}/comments")
 def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query(None)):
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
+    via = payload.author.strip() if payload.author and payload.author.strip() not in ("", "dashboard") else None
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
-        kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body)
+        kanban_db.add_comment(conn, task_id, author="dashboard", body=payload.body, source="api", via=via)
         return {"ok": True}
 
 

@@ -960,6 +960,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # Same ordering rule as the ``tasks`` indexes above: index after column.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
 
+    # task_comments provenance (F-1b/F-3, security review t_f469a059): legacy
+    # rows back-fill as NULL on all three — "unknown provenance", rendered as
+    # out-of-band everywhere a comment surfaces. See SCHEMA_SQL for the column
+    # semantics. Guarded like kanban_notify_subs/task_runs below: some legacy
+    # or deliberately pared-down test schemas lack task_comments entirely.
+    if _table_exists(conn, "task_comments"):
+        comment_cols = _column_names(conn, "task_comments")
+        for name, ddl in (
+            ("run_id", "run_id INTEGER"), ("source", "source TEXT"), ("via", "via TEXT"),
+        ):
+            if name not in comment_cols:
+                _add_column_if_missing(conn, "task_comments", name, ddl)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_run ON task_comments(run_id, id)")
+
     if _table_exists(conn, "kanban_notify_subs"):
         notify_cols = _column_names(conn, "kanban_notify_subs")
         for name, ddl in _NOTIFY_SUB_COLUMNS:
@@ -1073,8 +1087,11 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_comments ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
-        " created_at INTEGER NOT NULL)",
-        ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
+        " created_at INTEGER NOT NULL, run_id INTEGER, source TEXT, via TEXT)",
+        (
+            "CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",
+            "CREATE INDEX idx_comments_run ON task_comments(run_id, id)",
+        ),
     ),
     "task_runs": (
         "CREATE TABLE task_runs ("

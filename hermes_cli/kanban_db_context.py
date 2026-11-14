@@ -221,7 +221,13 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
     """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
     worker" framing stops an operator-controlled HERMES_PROFILE like
     "hermes-system" being read as a system directive above an
-    attacker-influenceable body (defense-in-depth)."""
+    attacker-influenceable body (defense-in-depth).
+
+    Any comment with no ``run_id`` is additionally tagged "(out-of-band — no
+    run provenance)" (F-1b, security review t_f469a059): the author is still
+    whatever caller resolved it (CLI/dashboard/relay), but nothing here proves
+    it was written by a genuine, currently-tracked run, so a future worker
+    should weigh verdict-sounding out-of-band text accordingly."""
     shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
     if not shown:
         return
@@ -234,6 +240,7 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
         # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
         # author-forgery surface was already closed in #22435. See #22452.
         safe_author = (c.author or "").replace("`", "")
-        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
+        provenance = "" if getattr(c, "run_id", None) is not None else " (out-of-band — no run provenance)"
+        lines.append(f"comment from worker `{safe_author}`{provenance} at {_ctx_stamp(c.created_at, now)}:")
         lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
         lines.append("")

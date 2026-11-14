@@ -721,12 +721,21 @@ class Comment:
     author: str
     body: str
     created_at: int
+    # Provenance (F-1b/F-3): None/None on legacy rows predating this migration,
+    # or on any caller that genuinely had no active run (out-of-band write).
+    run_id: Optional[int] = None
+    source: Optional[str] = None
+    via: Optional[str] = None
 
     @classmethod
     def from_row(cls, r: sqlite3.Row) -> Comment:
+        keys = r.keys()
         return cls(
             id=r["id"], task_id=r["task_id"], author=_lossy_text(r["author"]),
             body=_lossy_text(r["body"]), created_at=_to_epoch(r["created_at"]) or 0,
+            run_id=(int(r["run_id"]) if "run_id" in keys and r["run_id"] is not None else None),
+            source=(_lossy_text(r["source"]) if "source" in keys and r["source"] is not None else None),
+            via=(_lossy_text(r["via"]) if "via" in keys and r["via"] is not None else None),
         )
 
 
@@ -888,7 +897,18 @@ CREATE TABLE IF NOT EXISTS task_comments (
     task_id    TEXT NOT NULL,
     author     TEXT NOT NULL,
     body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- Provenance (F-1b/F-3, security review t_f469a059). ``run_id`` is the
+    -- writer's active dispatcher run (NULL = no run was active — an
+    -- out-of-band write from a CLI/relay/API caller with no run claim).
+    -- ``source`` names the write path: run | cli | api | relay | system
+    -- (NULL on legacy pre-migration rows = unknown). ``via`` is an optional,
+    -- purely cosmetic operator label (e.g. a dashboard form field); it is
+    -- NEVER trusted as authorship and must never be rendered or injected
+    -- as if it were ``author``.
+    run_id     INTEGER,
+    source     TEXT,
+    via        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -1668,21 +1688,45 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+_VALID_COMMENT_SOURCES = frozenset({"run", "cli", "api", "relay", "system"})
+
+
+def add_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
+    run_id: Optional[int] = None, source: str = "cli", via: Optional[str] = None,
+) -> int:
+    """Append a comment. ``author`` must be the caller's own resolved identity —
+    never accept it as free-text from an external caller (see #19713, F-1a):
+    board comments are injected into future workers' prompts and can live-steer
+    a running one, so an unvalidated author is an authorship-forgery vector.
+
+    ``run_id``/``source`` bind provenance (F-1b/F-3): pass the writer's active
+    dispatcher run id when one exists; ``source`` names the write path. A
+    caller with no active run MUST still pass ``run_id=None`` explicitly (the
+    default) rather than guess one — NULL is rendered as "out-of-band — no
+    run provenance" everywhere a comment surfaces, which is the whole point.
+    ``via`` is an optional, purely cosmetic operator label (never authorship).
+    """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    if source not in _VALID_COMMENT_SOURCES:
+        raise ValueError(f"invalid comment source {source!r}: must be one of {sorted(_VALID_COMMENT_SOURCES)}")
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
         _require_task(conn, task_id)
         cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
+            "INSERT INTO task_comments (task_id, author, body, created_at, run_id, source, via) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_id, author.strip(), body.strip(), now, run_id, source, (via.strip() if via else None)),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(
+            conn, task_id, "commented", {"author": author, "len": len(body), "source": source},
+            run_id=run_id,
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -1833,13 +1877,19 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
 
 
 def _insert_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str, created_at: int,
+    conn: sqlite3.Connection, task_id: str, author: str, body: str, created_at: int, *,
+    run_id: Optional[int] = None, source: str = "system",
 ) -> None:
     """Raw comment INSERT for callers already inside a write txn (``add_comment``
-    opens its own txn and emits ``commented``)."""
+    opens its own txn and emits ``commented``). Only ever called with a
+    hardcoded, trusted ``author`` (dispatcher/reconciliation/decompose system
+    messages) — never with caller-supplied text, so it carries no forgery risk
+    despite bypassing ``add_comment``'s validation. Defaults to
+    ``source="system"`` since these are internal lifecycle notes, not a run's
+    own output."""
     conn.execute(
-        "INSERT INTO task_comments (task_id, author, body, created_at) "
-        "VALUES (?, ?, ?, ?)", (task_id, author, body, created_at),
+        "INSERT INTO task_comments (task_id, author, body, created_at, run_id, source) "
+        "VALUES (?, ?, ?, ?, ?, ?)", (task_id, author, body, created_at, run_id, source),
     )
 
 
@@ -3719,6 +3769,7 @@ def invalidate_descendants_for_parent_reopen(
                 conn, row["id"], author, f"Invalidated: ancestor {task_id} was reopened; "
                 f"retracted from '{previous_status}' to 'todo' "
                 f"(will resume via '{resume_status}').", now,
+                run_id=run_id, source="system",
             )
             invalidated.append(entry)
     if not caller_owns_txn:

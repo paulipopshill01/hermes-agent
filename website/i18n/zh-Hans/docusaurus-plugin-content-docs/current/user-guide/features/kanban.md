@@ -557,7 +557,7 @@ hermes kanban assign <id> <profile>                    # 或 'none' 取消分配
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
 hermes kanban claim <id> [--ttl SECONDS]
-hermes kanban comment <id> "<text>" [--author NAME]
+hermes kanban comment <id> "<text>"
 
 # 批量动词 —— 接受多个 id：
 hermes kanban complete <id>... [--result "..."]
