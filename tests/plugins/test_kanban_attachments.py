@@ -239,6 +239,23 @@ def test_upload_list_download_delete_roundtrip(client):
     ).json()["attachments"] == []
 
 
+def test_upload_ignores_caller_supplied_uploaded_by(client):
+    """N-2 (security review t_87b48aca, CWE-285): the dashboard attach form
+    field for ``uploaded_by`` is gone entirely. A caller posting one anyway
+    must not get it stored — the row is always the fixed "dashboard" literal,
+    mirroring the comment endpoint's ``author="dashboard"`` treatment."""
+    task_id = _create_task_via_api(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("notes.txt", b"hi", "text/plain")},
+        data={"uploaded_by": "teknium"},
+    )
+    assert r.status_code == 200, r.text
+    att = r.json()["attachment"]
+    assert att["uploaded_by"] == "dashboard"
+    assert att["uploaded_by"] != "teknium"
+
+
 def test_upload_sanitizes_traversal_filename(client):
     task_id = _create_task_via_api(client)
     r = client.post(

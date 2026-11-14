@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
+    APIRouter, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -482,10 +482,12 @@ def list_task_attachments(task_id: str, board: Optional[str] = Query(None)):
 async def upload_task_attachment(
     task_id: str,
     file: UploadFile = File(...),
-    board: Optional[str] = Query(None),
-    uploaded_by: Optional[str] = Form(None)):
+    board: Optional[str] = Query(None)):
     """Store an upload under ``attachments_root(board)/<task_id>/`` (sanitised,
-    collision-resolved name; ``_safe_attachment_name`` ValueError → 400) and record it."""
+    collision-resolved name; ``_safe_attachment_name`` ValueError → 400) and record it.
+    ``uploaded_by`` is always the fixed literal ``"dashboard"`` (mirrors the comment
+    endpoint's ``author=\"dashboard\"``) — a caller-supplied form field here would be
+    displayed attribution the REST caller fully controls (CWE-285, N-2)."""
     with _board_conn(board) as (board, conn), _value_error_400():
         _require_task(conn, task_id)
         safe_name = _safe_attachment_name(file.filename or "")
@@ -507,7 +509,7 @@ async def upload_task_attachment(
             raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
         att_id = kanban_db.add_attachment(
             conn, task_id, filename=dest_path.name, stored_path=str(dest_path.resolve()),
-            content_type=file.content_type, size=total, uploaded_by=(uploaded_by or "dashboard"))
+            content_type=file.content_type, size=total, uploaded_by="dashboard")
         att = kanban_db.get_attachment(conn, att_id)
         return {"attachment": _attachment_dict(att) if att else None}
 

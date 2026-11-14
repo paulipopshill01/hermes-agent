@@ -1691,6 +1691,36 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 _VALID_COMMENT_SOURCES = frozenset({"run", "cli", "api", "relay", "system"})
 
 
+def _validated_run_provenance(
+    conn: sqlite3.Connection, author: str, run_id: Optional[int], source: str,
+) -> tuple[Optional[int], str]:
+    """Verify ``run_id`` actually belongs to ``author`` before a comment write
+    trusts it (CWE-345): a dispatcher-set ``HERMES_KANBAN_RUN_ID`` env var is
+    NOT caller input in the usual sense, but nothing stops a bare shell from
+    exporting an arbitrary value naming someone else's real run — at which
+    point ``source=\"run\"`` renders as authoritative, in-run provenance for a
+    comment the env owner never earned. Resolve the run's recorded
+    ``profile`` and require it to equal ``author``; any mismatch (including
+    no such run) downgrades honestly instead of trusting the unverified id.
+
+    Accepted residual: an attacker who also controls (or matches) a REAL
+    run's profile — i.e. forges ``author`` to equal a run they're legitimately
+    bound to, or is that run's own profile — still passes this check. That is
+    full identity impersonation, not a provenance gap, and is indistinguishable
+    from genuine activity anywhere in the system (see F-4/R-4 in the
+    2026-11-14 security review); it is not this function's job to fix.
+    """
+    if run_id is None:
+        return None, source
+    row = conn.execute(
+        "SELECT profile FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    if row is None or (row["profile"] or "").strip() != (author or "").strip():
+        run_id = None
+        source = "cli" if source == "run" else source  # honest downgrade
+    return run_id, source
+
+
 def add_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
     run_id: Optional[int] = None, source: str = "cli", via: Optional[str] = None,
@@ -1718,6 +1748,7 @@ def add_comment(
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
         _require_task(conn, task_id)
+        run_id, source = _validated_run_provenance(conn, author, run_id, source)
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at, run_id, source, via) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1881,12 +1912,19 @@ def _insert_comment(
     run_id: Optional[int] = None, source: str = "system",
 ) -> None:
     """Raw comment INSERT for callers already inside a write txn (``add_comment``
-    opens its own txn and emits ``commented``). Only ever called with a
-    hardcoded, trusted ``author`` (dispatcher/reconciliation/decompose system
-    messages) — never with caller-supplied text, so it carries no forgery risk
-    despite bypassing ``add_comment``'s validation. Defaults to
-    ``source="system"`` since these are internal lifecycle notes, not a run's
-    own output."""
+    opens its own txn and emits ``commented``). The true invariant is NOT
+    "never with caller-supplied text" — ``specify_triage_task``/
+    ``decompose_triage_task`` route here with a real resolved ``author=``
+    (dashboard/CLI profile identity, not free text since R-2). What this
+    function skips is ``add_comment``'s own validation (body/author
+    required, source whitelist, the ``commented`` event), which callers here
+    either don't need or already did. ``run_id`` is still re-validated below
+    (CWE-345: #19713 N-1) exactly like ``add_comment`` — a forged env
+    ``run_id`` must not ride along on this path either. Defaults to
+    ``source=\"system\"`` since most of these are internal lifecycle notes,
+    not a run's own output.
+    """
+    run_id, source = _validated_run_provenance(conn, author, run_id, source)
     conn.execute(
         "INSERT INTO task_comments (task_id, author, body, created_at, run_id, source) "
         "VALUES (?, ?, ?, ?, ?, ?)", (task_id, author, body, created_at, run_id, source),

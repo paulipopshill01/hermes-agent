@@ -126,9 +126,11 @@ def test_cli_comment_inside_a_dispatched_run_carries_run_id(kanban_home, monkeyp
     """A CLI call made from inside a dispatched worker's own terminal session
     — the exact write path of the 2026-11-14 incident — picks up real run
     provenance from dispatcher-set env (not caller input) instead of being
-    silently unbound."""
+    silently unbound. N-1 (#57070ca4): the run's recorded profile must also
+    match the author, so the task is assigned to the same profile that
+    claims/comments on it — a real run, not just a real-looking id."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="t")
+        tid = kb.create_task(conn, title="t", assignee="stella")
         run_id = kb.claim_task(conn, tid) and kb._current_run_id(conn, tid)
     monkeypatch.setenv("HERMES_PROFILE", "stella")
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)

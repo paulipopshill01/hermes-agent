@@ -1102,9 +1102,9 @@ def test_decompose_ignores_caller_supplied_author(client, monkeypatch):
 
     with kbc.connect_closing() as conn:
         comments = kb.list_comments(conn, t["id"])
-    if comments:
-        assert comments[0].author == "dashboard"
-        assert all(c.author != "ui-tester" for c in comments)
+    assert comments
+    assert comments[0].author == "dashboard"
+    assert all(c.author != "ui-tester" for c in comments)
 
 
 # ---------------------------------------------------------------------------
