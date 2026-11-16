@@ -403,6 +403,46 @@ def _mark_incident_alerted(incident_id: Optional[str]) -> None:
         logger.debug("Failed marking incident %s alerted: %s", incident_id, exc)
 
 
+def _send_recovery_notice_for_unalerted_incidents(job: dict, *, adapters, loop) -> None:
+    """Alert-suppression-on-auto-heal fix (CWE-778): before a successful run's own incidents get
+    silently resolved by ``close_incidents_for_recovered_job`` (called next, inside
+    ``_compose_run_delivery``), send one synchronous recovery notice for any of this job's
+    incidents that are ``detected``/``alerted`` with ``alerted_at`` still NULL — the set a fast
+    self-heal would otherwise resolve before the ORIGINAL failure's async delivery ever confirmed,
+    permanently losing the notification. Fires synchronously in this success-path callback (NOT
+    via the async delivery queue) per the plan's design decision: checking ledger state at this
+    instant avoids depending on an in-flight delivery's eventual outcome, and needs no new
+    reconciler/timeout mechanism. Store/delivery errors log at debug — a notification failure must
+    never fail the job's own success status (same non-fatal pattern as
+    ``_resolve_incidents_for_recovered_job`` below). Silent (no-op) when the job's
+    ``failure_deliver`` resolves to no live channel — respects the existing quiet-by-design
+    convention (Finding 1 scope) rather than overriding it, and does not backfill alerts for
+    incidents that already carry ``alerted_at`` (no double-alert)."""
+    try:
+        from cron.incidents import list_unalerted_incidents_for_job, set_incident_state
+
+        pending = list_unalerted_incidents_for_job(job["id"])
+        if not pending:
+            return
+        if not _resolve_delivery_targets(job, for_failure=True):
+            return  # failure_deliver -> local/absent: stays silent, same as Finding 1's convention
+        from cron.scheduler_failure_copy import recovery_notice
+
+        for incident in pending:
+            try:
+                notice = recovery_notice(job.get("name") or job["id"], job["id"], incident)
+                error = _deliver_result(job, notice, adapters=adapters, loop=loop, for_failure=True)
+                if not error:
+                    set_incident_state(incident["id"], "alerted")
+            except Exception as exc:
+                logger.debug(
+                    "Recovery notice failed for job %s incident %s: %s",
+                    job["id"], incident.get("id"), exc)
+    except Exception as exc:
+        logger.debug(
+            "Incident store unavailable for job %s (recovery notice skipped): %s", job["id"], exc)
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the assembled prompt (incl. runtime-loaded skill content,
     unseen by create-time scanning) trips the injection scanner; run_job turns it into a clean
@@ -3079,6 +3119,12 @@ def _save_compose_deliver(
             "Interrupted by gateway shutdown before the run finished "
             "(tool subprocess was killed mid-flight)."
         )
+
+    if d.success:
+        # Must run BEFORE _compose_run_delivery: that call's success branch unconditionally
+        # resolves this job's open incidents (close_incidents_for_recovered_job), which would
+        # otherwise silently lose any never-alerted one (alert-suppression-on-auto-heal, CWE-778).
+        _send_recovery_notice_for_unalerted_incidents(job, adapters=adapters, loop=loop)
 
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,

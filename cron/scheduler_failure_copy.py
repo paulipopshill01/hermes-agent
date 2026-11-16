@@ -136,6 +136,21 @@ def inactivity_notice(job_name: str, job_id: str) -> str:
     )
 
 
+def recovery_notice(job_name: str, job_id: str, incident: dict) -> str:
+    """Backstop notice (alert-suppression-on-auto-heal fix, CWE-778): the job auto-recovered from
+    a failure whose alert was never confirmed delivered, so the operator would otherwise never
+    learn it happened at all. ``incident['error']`` is the already-redacted, length-bounded text
+    stored by ``cron.incidents.upsert_incident`` — never raw/unredacted error text."""
+    cleaned_error = str(incident.get("error") or "").strip() or "unknown error"
+    first_seen = incident.get("first_seen_at") or "an earlier run"
+    return (
+        f"\u2705 Cron '{job_name}' recovered, but its prior failure was never confirmed "
+        f"delivered to you: {cleaned_error}. First seen {first_seen}; the job has since "
+        f"succeeded and that incident is now resolved. See the full history with "
+        f"`hermes cron runs {job_id}`."
+    )
+
+
 def blocked_config_notice(job_name: str, reason: str) -> str:
     """One-time notice when the pre-run configuration check refused to start the job."""
     reason = reason.rstrip()

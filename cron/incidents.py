@@ -257,6 +257,20 @@ def close_incidents_for_recovered_job(job_id: str) -> int:
         return int(cursor.rowcount or 0)
 
 
+def list_unalerted_incidents_for_job(job_id: str) -> list[dict[str, Any]]:
+    """Open incidents (``detected``/``alerted``) for ``job_id`` whose alert was never confirmed
+    delivered (``alerted_at IS NULL``) — the set ``close_incidents_for_recovered_job`` would
+    otherwise resolve silently (alert-suppression-on-auto-heal race, CWE-778: a fast self-heal can
+    win against the async delivery queue confirming the original failure alert)."""
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT * FROM cron_incidents WHERE job_id=? AND state IN ('detected','alerted') "
+            "AND alerted_at IS NULL ORDER BY first_seen_at",
+            (str(job_id or ""),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _state_filter(state: Optional[str]) -> tuple[str, tuple]:
     return ("", ()) if state is None else (" WHERE state=?", (state,))
 
