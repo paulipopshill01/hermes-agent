@@ -32,6 +32,7 @@ from agent.display import (
 )
 from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
 from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wording
+from agent.memory_context import sanitize_context
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent import plugin_live_notes
@@ -1110,6 +1111,18 @@ def _commit_tool_result(
     """
     function_name, function_args, tool_call_id, effective_task_id = ref.name, ref.args, ref.call_id, ref.task_id
     from hermes_cli.observability.shared_metrics_harness import observe_tool_outcome
+
+    # Hard, always-on fence-strip (2026-11-20 fence-escape remediation): every tool's
+    # string-shaped result is sanitized here, in the one chokepoint all three dispatch
+    # paths (sequential :1863, concurrent :1580, segmented delegates to both) funnel
+    # through before a result is ever appended to ``messages``. This covers every
+    # plugin/tool/MCP server, present and future, regardless of whether a
+    # transform_tool_result hook is registered (that hook stays untouched — opt-in,
+    # separate mechanism). Dict/multimodal results are left alone (not sliceable as
+    # strings; _is_multimodal_tool_result is checked further below for persistence,
+    # but the guard here must come first since those shapes aren't str at all).
+    if isinstance(function_result, str):
+        function_result = sanitize_context(function_result)
 
     observe_tool_outcome(agent, function_name, is_error)
     if not (blocked or is_error):
