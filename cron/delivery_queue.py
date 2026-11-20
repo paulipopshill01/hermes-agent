@@ -203,6 +203,30 @@ def enqueue(
     return dict(row)
 
 
+def record_direct_delivery(execution_id: str) -> bool:
+    """Audit-ledger row for a send that bypassed enqueue() (adapters-present/direct path).
+
+    R-3 (CWE-778): the queue path (enqueue -> claim_next -> _finish) is the only writer to
+    ``deliveries``, so a delivery that never queues -- live adapters already present, or the
+    standalone-fallback path -- left zero audit trail even though the message landed. This
+    writes an ALREADY-TERMINAL row (status='delivered', never 'pending'), so it is inert to
+    the drain/retry machinery: ``claim_next`` only claims 'pending' rows, and ``_finish`` only
+    transitions a row this process itself claimed into 'delivering'. INSERT OR IGNORE keyed to
+    execution_id makes a double-call (e.g. recovered-execution replays) a safe no-op. job_json
+    and content are stored empty per the terminal-row pruning convention in
+    ``_prune_terminal_unlocked`` -- this is an audit marker, not a replay payload.
+    """
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO deliveries
+               (execution_id, job_json, content, for_failure, status, created_at, finished_at)
+               VALUES (?, '{}', '', 0, 'delivered', ?, ?)""",
+            (str(execution_id), now, now),
+        )
+        return cur.rowcount == 1
+
+
 def get_status(execution_id: str) -> Optional[dict]:
     with _transaction() as conn:
         row = conn.execute(

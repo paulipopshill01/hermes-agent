@@ -109,6 +109,21 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     if delivery_outcome == "queued":
         # A drain that already finished this send (cron/delivery_outcome.py) is the real outcome.
         delivery_outcome = settled_outcome(execution_id) or "queued"
+    if delivery_outcome == "delivered":
+        # R-3 (CWE-778): the queue path's enqueue()->claim_next()->_finish() is the ONLY
+        # writer to deliveries.db. A delivered send that never queued (live adapters already
+        # present, or the standalone-fallback path) left no audit row even though the message
+        # landed -- indistinguishable from a real delivery failure on that path. Write the
+        # audit marker unconditionally here, independent of which send path delivered it.
+        # An audit-write failure must never block the job's own completion (R-3-F1): report
+        # it to stderr -- never stdout, which is the delivery lane -- and proceed as before.
+        try:
+            from cron.delivery_queue import record_direct_delivery
+            record_direct_delivery(execution_id)
+        except Exception as exc:
+            import sys
+            print(f"R-3-F1: deliveries.db audit write failed for execution {execution_id}: {exc!r}",
+                  file=sys.stderr)
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         scheduler._mark_incident_alerted(d.failure_incident_id)
