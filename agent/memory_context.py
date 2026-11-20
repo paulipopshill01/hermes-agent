@@ -7,6 +7,7 @@ leaves the agent. Pure text formatting: no provider calls, no profile state.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 
@@ -18,6 +19,18 @@ _INTERNAL_NOTE_RE = re.compile(
     r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*',
     re.IGNORECASE,
 )
+# Tool-result side ONLY (never the injection path): the strict sentence-literal
+# _INTERNAL_NOTE_RE above is narrower than the real framing shape and is what
+# build_memory_context_block's own injected text matches 7/7 against — keep it
+# untouched there. On a tool's OUTPUT, we don't control the exact wording a
+# poisoned write used, so match the bracket-framing shape itself (anything that
+# looks like "[System note: ...]"), closing punctuation/newline-placement
+# variants (period-for-comma, newline-before-']') that defeat the strict regex
+# even on correctly-decoded text. FP trade-off (Viktor B-1, Ada's call: broad on
+# tool-result, strict on injection): a tool legitimately quoting a system note
+# verbatim (e.g. a security report discussing this exact fence class) has that
+# quoted span stripped too -- cosmetic loss, surrounding content is untouched.
+_TOOL_RESULT_NOTE_RE = re.compile(r'\[System note:[^\]]*\]\s*', re.IGNORECASE)
 
 
 def sanitize_context(text: str) -> str:
@@ -25,6 +38,59 @@ def sanitize_context(text: str) -> str:
     for pattern in (_INTERNAL_CONTEXT_RE, _INTERNAL_NOTE_RE, _FENCE_TAG_RE):
         text = pattern.sub('', text)
     return text
+
+
+def _sanitize_tool_result_text(text: str) -> str:
+    """Tool-result-side strip: same fence/context patterns as ``sanitize_context`` but the
+    broader framing-shape note regex (see ``_TOOL_RESULT_NOTE_RE``). Called on already-DECODED
+    string leaves only -- never on a JSON-serialized blob, where escaped whitespace (``\\n``,
+    ``\\t``, ``\\u2028``) defeats every ``\\s*``/literal-text pattern here (Viktor B-1)."""
+    for pattern in (_INTERNAL_CONTEXT_RE, _TOOL_RESULT_NOTE_RE, _FENCE_TAG_RE):
+        text = pattern.sub('', text)
+    return text
+
+
+def _sanitize_json_leaves(value):
+    """Recursively apply ``_sanitize_tool_result_text`` to every string leaf of a decoded
+    JSON value (dict/list/str passthrough for everything else) -- the walk, not the regex,
+    is what survives JSON escaping: by the time a value is a leaf here it has already been
+    json.loads'd back into a real string with real newlines."""
+    if isinstance(value, str):
+        return _sanitize_tool_result_text(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_json_leaves(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_json_leaves(v) for v in value]
+    return value
+
+
+def sanitize_tool_result(text: str) -> str:
+    """Phase B fence-strip for ``_commit_tool_result`` (2026-11-20 fence-escape remediation,
+    Viktor B-1 fix). Plain ``sanitize_context`` only ever sees the final, already-serialized
+    string a tool returns -- most plugins (Honcho included) hand back ``json.dumps({...})``,
+    whose JSON-escaped newlines/whitespace (``\\n``, ``\\t``, ``\\u2028``) never match any of
+    ``sanitize_context``'s ``\\s*``/literal-text regexes, so a poisoned stored string survives
+    verbatim past the "universal" chokepoint. Decode-then-strip closes that: if ``text`` parses
+    as JSON, walk every string leaf of the DECODED structure (real newlines again), sanitize
+    each leaf, then re-serialize with the same separators json.dumps would already use for a
+    tool result (compact is fine -- this is a machine-to-model payload, not a pretty-printed
+    doc). Non-JSON text (the common non-Honcho case) falls back to a direct raw-string strip,
+    same as before. Never raises: a json.JSONDecodeError on non-JSON input is the normal case
+    for this fallback, not a defect; any other unexpected error also degrades to the raw-string
+    path rather than ever skipping the strip entirely."""
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        decoded = json.loads(text)
+    except (ValueError, TypeError):
+        return _sanitize_tool_result_text(text)
+    try:
+        cleaned = _sanitize_json_leaves(decoded)
+        return json.dumps(cleaned, ensure_ascii=False)
+    except (TypeError, ValueError):
+        # Decoded fine but re-serialization choked on something exotic (e.g. a non-finite
+        # float) -- fail closed to the raw-string strip rather than ship the unsanitized text.
+        return _sanitize_tool_result_text(text)
 
 
 def fence_recalled_context(text: str) -> str:

@@ -32,7 +32,7 @@ from agent.display import (
 )
 from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
 from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wording
-from agent.memory_context import sanitize_context
+from agent.memory_context import sanitize_tool_result
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent import plugin_live_notes
@@ -1122,7 +1122,7 @@ def _commit_tool_result(
     # strings; _is_multimodal_tool_result is checked further below for persistence,
     # but the guard here must come first since those shapes aren't str at all).
     if isinstance(function_result, str):
-        function_result = sanitize_context(function_result)
+        function_result = sanitize_tool_result(function_result)
 
     observe_tool_outcome(agent, function_name, is_error)
     if not (blocked or is_error):
