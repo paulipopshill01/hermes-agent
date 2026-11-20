@@ -1121,6 +1121,16 @@ def _commit_tool_result(
     # separate mechanism). Dict/multimodal results are left alone (not sliceable as
     # strings; _is_multimodal_tool_result is checked further below for persistence,
     # but the guard here must come first since those shapes aren't str at all).
+    # Expected behavior of sanitize_tool_result (see agent/memory_context.py:67):
+    # if function_result parses as JSON (the real Honcho _tool_* shape, e.g.
+    # json.dumps({"result": <payload>})), it is json.loads'd, every string leaf of
+    # the decoded structure is fence-stripped, and the result is re-serialized with
+    # json.dumps -- this is required because JSON-escaped newlines/whitespace never
+    # match the raw-string regexes. A bare (non-JSON) string falls back to a direct
+    # raw-string strip. Both pathways are covered end-to-end in
+    # tests/agent/test_tool_executor_fence_strip.py (see
+    # test_sequential_path_neutralizes_json_wrapped_hostile_payload and
+    # test_sequential_path_neutralizes_bare_hostile_payload).
     if isinstance(function_result, str):
         function_result = sanitize_tool_result(function_result)
 
