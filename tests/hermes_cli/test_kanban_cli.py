@@ -293,3 +293,78 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Gate enforcement CLI surface (F-A, CWE-862) — identity-spoofing regression
+# ---------------------------------------------------------------------------
+
+
+def test_cli_complete_gate_override_identity_resolved_not_spoofable(kanban_home, monkeypatch):
+    """CLI-LEVEL test for the identity-spoofing regression class: exercises
+    the real argparse path (kanban_parser.py + kanban.py's _cmd_complete),
+    NOT kanban_db internals directly. A unit test calling
+    ``_check_gate_requirements``/``_gate_unmet_approval`` with a literal
+    identity parameter would NOT catch a bug where the CLI fabricates or
+    hardcodes an identity instead of resolving it for real — this test would.
+
+    ``hermes_cli.profiles.current_profile_name`` is the single underlying
+    identity mechanism shared by ``kanban.py``'s ``_profile_author()`` and
+    ``kanban_db.py``'s ``_resolved_caller_identity()``; faking it here (not
+    the gate internals) proves the CLI never lets ``--override-gate``
+    substitute a caller-supplied string for that resolution.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    gate_home = kanban_home / "profiles" / "stella"
+    gate_home.mkdir(parents=True, exist_ok=True)
+    (gate_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+    with kbc.connect_closing() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Stella Gate 1 ({gate_card}).",
+        )
+
+    override_cmd = f'complete {t} --result "shipping now" --override-gate --override-reason "deadline"'
+
+    # Resolved identity is "alice" (NOT dave): the override must still fail,
+    # even though --override-gate/--override-reason were both supplied.
+    monkeypatch.setattr(profiles_mod, "current_profile_name", lambda default=None: "alice")
+    out = kc.run_slash(override_cmd)
+    assert "dave" in out.lower(), out
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, t).status != "done"
+
+    # Resolved identity is "dave": the SAME command now succeeds, proving the
+    # CLI resolves identity for real rather than trusting any flag value.
+    monkeypatch.setattr(profiles_mod, "current_profile_name", lambda default=None: "dave")
+    out2 = kc.run_slash(override_cmd)
+    assert "Completed" in out2, out2
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, t)
+        assert task.status == "done"
+        events = kb.list_events(conn, t)
+        override_event = next(e for e in events if e.kind == "gate_override")
+        assert override_event.payload["overridden_by"] == "dave"
+
+
+def test_cli_complete_without_override_names_the_unmet_gate(kanban_home):
+    gate_home = kanban_home / "profiles" / "stella"
+    gate_home.mkdir(parents=True, exist_ok=True)
+    (gate_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+    with kbc.connect_closing() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Stella Gate 1 ({gate_card}).",
+        )
+
+    out = kc.run_slash(f'complete {t} --result "done anyway"')
+    assert "unresolved gate" in out.lower()
+    assert "stella" in out.lower()
+    assert "--override-gate" in out
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, t).status != "done"
+
+

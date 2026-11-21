@@ -2279,6 +2279,22 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
+        # Fail closed (Task 6, CWE-862 follow-up): a card whose BODY names a
+        # gate ref that isn't yet a real parents[] link (``hermes kanban
+        # link`` not run) must not be claimed — the marker is cosmetic until
+        # it is backed by a structural edge. Same demote-and-log shape as the
+        # undone-parent case above, distinct reason string.
+        mismatched_ref = _gate_marker_matches_parents(conn, task_id)
+        if mismatched_ref is not None:
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'", (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "gate_marker_not_linked", "ref": mismatched_ref},
+            )
+            return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
@@ -2311,6 +2327,21 @@ def claim_review_task(
                 _append_event(
                     conn, task_id, "dependency_wait",
                     {"reason": "parent_reopened", "source_status": "review"},
+                )
+            return None
+        # Mirror of claim_task's Task 6 check: review->running must not
+        # proceed on a body-text gate marker whose ref isn't a real parents[]
+        # link either.
+        mismatched_ref = _gate_marker_matches_parents(conn, task_id)
+        if mismatched_ref is not None:
+            demoted = conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
+            )
+            if demoted.rowcount == 1:
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "gate_marker_not_linked", "ref": mismatched_ref, "source_status": "review"},
                 )
             return None
         run_id = _claim_and_open_run(
@@ -2730,6 +2761,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    override_gate: bool = False, override_reason: Optional[str] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2747,6 +2779,10 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+    A card gated on a named holder's verdict (see :func:`_gate_unmet_approval`)
+    raises :class:`GateUnmetError` unless ``override_gate=True`` with a
+    non-empty ``override_reason`` AND the resolved calling identity is
+    ``dave`` — never from a caller-supplied identity string (F-1 mirror).
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2755,6 +2791,9 @@ def complete_task(
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    # Cheap pre-check; re-checked inside the txn to close the gate-holder race
+    # (the gate card could be un-done again between here and the write txn).
+    _check_gate_requirements(conn, task_id, override_gate=override_gate, override_reason=override_reason)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -2767,6 +2806,9 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        gate_override_payload = _check_gate_requirements(
+            conn, task_id, override_gate=override_gate, override_reason=override_reason,
+        )
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
@@ -2816,6 +2858,9 @@ def complete_task(
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
+        if gate_override_payload is not None:
+            # Lands BEFORE 'completed' so both are visible in order (Task 2).
+            _append_event(conn, task_id, "gate_override", gate_override_payload, run_id=run_id)
         _append_event(
             conn, task_id, "completed",
             _completed_event_payload(result, event_summary, verified_cards, metadata),
@@ -2894,6 +2939,230 @@ def _gate_empty_completion(
             },
         )
     raise EmptyCompletionError(task_id)
+
+
+# --- Gate enforcement (F-A, CWE-862: fail-closed `kanban complete`) ---
+#
+# A build card can declare a dependency on a human/agent "gate" review in
+# free text (its own body) or structurally (a sibling gate-review card under
+# the same parent). Historically nothing stopped `complete_task` from
+# closing such a card before that gate-holder actually signed off — the
+# marker was advisory only. `_gate_unmet_approval` makes it a hard
+# invariant: unresolved or unparseable gate language blocks completion
+# unless the single resolved-identity "dave" override path (below) is used.
+
+# Parent-side marker: "Gated on <holder>['s] Gate <1|2> [approval] (<ref>)".
+# Anchored to the literal "Gated on" prefix — merely mentioning "Gate 1" in
+# prose must NOT trip this (a false-positive block is a real regression
+# risk the design calls out explicitly; see the negative-case test).
+_GATE_MARKER_RE = re.compile(
+    r"Gated on (?P<holder>\w+)(?:'s)? Gate (?P<n>1|2)(?: approval)? \((?P<ref>t_[0-9a-f]+)\)",
+    re.IGNORECASE,
+)
+
+# Child-side marker: a sibling card (same parent as the gated task) whose
+# TITLE starts with one of these prefixes is itself the gate; its
+# ``assignee`` is the gate-holder, no separate config table.
+_GATE_CHILD_TITLE_PREFIXES: tuple[str, ...] = (
+    "stella gate 2:", "gate 2 for", "security closure:",
+)
+
+# Recognized verdict tokens, case-insensitive, anywhere in a comment body.
+# "PLAN APPROVED" is already covered by the plain "APPROVED" substring check
+# but is kept explicit to mirror the spec literally.
+_GATE_VERDICT_TOKENS: tuple[str, ...] = ("APPROVED", "CLEARED", "PLAN APPROVED")
+
+
+class GateUnmetError(ValueError):
+    """``complete_task`` refused: a named gate-holder's verdict is not
+    resolved. Same family as :class:`EmptyCompletionError`/
+    :class:`HallucinatedCardsError`/:class:`LiveClaimError` — a
+    ``ValueError`` so tool error handlers treat it as recoverable.
+
+    ``reason`` is ``"unresolved: ..."`` (gate card/child exists but isn't
+    done, or is done without a verdict comment from its holder) or
+    ``"parse_failure: ..."`` (marker found but the ref or holder name does
+    not resolve) — same fail-closed bucket, distinguished only for logging.
+    """
+
+    def __init__(
+        self, task_id: str, reason: str, *,
+        holder: Optional[str] = None, card_ref_or_child: Optional[str] = None,
+        gate_type: Optional[str] = None,
+    ):
+        self.task_id = task_id
+        self.reason = reason
+        self.holder = holder
+        self.card_ref_or_child = card_ref_or_child
+        self.gate_type = gate_type
+        super().__init__(f"completion blocked: {task_id} has an unresolved gate ({reason})")
+
+
+def _comment_has_gate_verdict(body: Optional[str]) -> bool:
+    upper = (body or "").upper()
+    return any(token in upper for token in _GATE_VERDICT_TOKENS)
+
+
+def _find_parent_gate_marker(body: Optional[str]) -> Optional[tuple[str, str, str]]:
+    """``(holder, gate_n, ref)`` from the parent-side body marker, or None."""
+    if not body:
+        return None
+    m = _GATE_MARKER_RE.search(body)
+    if not m:
+        return None
+    return m.group("holder"), m.group("n"), m.group("ref")
+
+
+def _find_child_gate_marker(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, Optional[str], str]]:
+    """``(child_id, assignee, gate_n)`` for a sibling gate-review card under
+    ``task_id``'s own parent(s) (title-prefix match), or None."""
+    for pid in parent_ids(conn, task_id):
+        for cid in child_ids(conn, pid):
+            if cid == task_id:
+                continue
+            sibling = get_task(conn, cid)
+            if not sibling or not sibling.title:
+                continue
+            title_lower = sibling.title.strip().lower()
+            for prefix in _GATE_CHILD_TITLE_PREFIXES:
+                if title_lower.startswith(prefix):
+                    gate_n = "2" if "2" in prefix else "1"
+                    return cid, sibling.assignee, gate_n
+    return None
+
+
+def _gate_unmet_approval(conn: sqlite3.Connection, task_id: str) -> None:
+    """Raise :class:`GateUnmetError` when ``task_id`` names a gate (body
+    marker or sibling gate-review card) that is not satisfied; return (no
+    raise) when there is no marker at all, or the named gate is satisfied.
+
+    Resolution order: parent-side body marker first, then the child-side
+    sibling marker — the first one found decides (a card is expected to use
+    exactly one form).
+    """
+    known_profiles = {p.lower() for p in list_profiles_on_disk()}
+
+    task = get_task(conn, task_id)
+    marker = _find_parent_gate_marker(task.body if task else None)
+    if marker is not None:
+        holder, gate_n, ref = marker
+        if holder.lower() not in known_profiles:
+            raise GateUnmetError(
+                task_id, f"parse_failure: gate holder {holder!r} is not a known profile",
+                holder=holder, card_ref_or_child=ref, gate_type=gate_n,
+            )
+        ref_task = get_task(conn, ref)
+        if ref_task is None:
+            raise GateUnmetError(
+                task_id, f"parse_failure: gate ref {ref} does not resolve to an existing card",
+                holder=holder, card_ref_or_child=ref, gate_type=gate_n,
+            )
+        if ref_task.status != "done":
+            raise GateUnmetError(
+                task_id, f"unresolved: gate card {ref} (holder {holder}) is not done "
+                         f"(status={ref_task.status})",
+                holder=holder, card_ref_or_child=ref, gate_type=gate_n,
+            )
+        if not any(
+            c.author and c.author.lower() == holder.lower() and _comment_has_gate_verdict(c.body)
+            for c in list_comments(conn, ref)
+        ):
+            raise GateUnmetError(
+                task_id, f"unresolved: gate card {ref} has no verdict comment from {holder}",
+                holder=holder, card_ref_or_child=ref, gate_type=gate_n,
+            )
+        return
+
+    child_marker = _find_child_gate_marker(conn, task_id)
+    if child_marker is not None:
+        child_id, assignee, gate_n = child_marker
+        if not assignee or assignee.lower() not in known_profiles:
+            raise GateUnmetError(
+                task_id, f"parse_failure: gate child {child_id} has no known-profile assignee "
+                         f"(got {assignee!r})",
+                holder=assignee, card_ref_or_child=child_id, gate_type=gate_n,
+            )
+        child_task = get_task(conn, child_id)
+        if child_task is None or child_task.status != "done":
+            raise GateUnmetError(
+                task_id, f"unresolved: gate child {child_id} (holder {assignee}) is not done "
+                         f"(status={child_task.status if child_task else 'missing'})",
+                holder=assignee, card_ref_or_child=child_id, gate_type=gate_n,
+            )
+        if not any(
+            c.author and c.author.lower() == assignee.lower() and _comment_has_gate_verdict(c.body)
+            for c in list_comments(conn, child_id)
+        ):
+            raise GateUnmetError(
+                task_id, f"unresolved: gate child {child_id} has no verdict comment from {assignee}",
+                holder=assignee, card_ref_or_child=child_id, gate_type=gate_n,
+            )
+        return
+
+    return  # not gated at all — the common case
+
+
+def _resolved_caller_identity() -> str:
+    """Single calling-identity resolution for the gate override check and its
+    audit log. Mirrors ``hermes_cli.kanban._profile_author()`` exactly (same
+    underlying ``current_profile_name`` call) — deliberately NOT a second
+    identity mechanism, and NEVER fed by a caller-supplied string (a prior
+    incident, F-1, let ``--author`` be spoofed this way; don't repeat it)."""
+    from hermes_cli.profiles import current_profile_name
+    return current_profile_name("user") or "user"
+
+
+def _check_gate_requirements(
+    conn: sqlite3.Connection, task_id: str, *, override_gate: bool, override_reason: Optional[str],
+) -> Optional[dict]:
+    """Pre-txn and in-txn gate enforcement for :func:`complete_task`.
+
+    Returns a ``gate_override`` event payload when a dave-authorized override
+    consumed an unresolved gate; ``None`` when the task is ungated or its
+    gate is already satisfied (the common/regression-guarded case — zero
+    behavior change). Otherwise re-raises :class:`GateUnmetError` — any
+    combination other than ``override_gate=True`` + non-empty
+    ``override_reason`` + resolved identity == ``"dave"`` fails closed.
+    """
+    try:
+        _gate_unmet_approval(conn, task_id)
+    except GateUnmetError as exc:
+        reason_text = str(override_reason).strip() if override_reason else ""
+        identity = _resolved_caller_identity()
+        if override_gate and reason_text and identity == "dave":
+            return {
+                "holder": exc.holder,
+                "card_ref_or_child": exc.card_ref_or_child,
+                "reason_bucket": exc.reason.split(":", 1)[0],
+                "gate_type": exc.gate_type,
+                "override_reason": reason_text,
+                "overridden_by": identity,
+            }
+        raise
+    return None
+
+
+def _gate_marker_matches_parents(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Claim-time structural check (Task 6): a card whose BODY names a gate
+    ref via the parent-side marker, but whose real ``parents[]`` does not yet
+    contain that ref (``hermes kanban link`` not run), must not be claimed —
+    the marker is cosmetic until backed by a structural edge. Deliberately
+    parent-side only (the child-side title marker has no body ref to check).
+
+    Returns the unmatched ref, or ``None`` when there is no marker at all, or
+    the marker's ref is already a real parent (zero regression on the common
+    ungated case, and on the already-linked case).
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    marker = _find_parent_gate_marker(task.body)
+    if marker is None:
+        return None
+    _holder, _gate_n, ref = marker
+    if ref in parent_ids(conn, task_id):
+        return None
+    return ref
 
 
 def _stage_completion_artifacts(

@@ -959,11 +959,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                                        force=bool(getattr(args, "force", False)),
+                                        override_gate=bool(getattr(args, "override_gate", False)),
+                                        override_reason=getattr(args, "override_reason", None))
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
                                  f"--force to close its run and complete anyway.")
+                return False
+            except kb.GateUnmetError as gate_err:
+                fail_msg[tid] = (
+                    f"cannot complete {tid}: unresolved gate — {gate_err.reason} "
+                    f"(holder: {gate_err.holder or '?'}, gate ref/child: {gate_err.card_ref_or_child or '?'}). "
+                    f"Resubmit with `hermes kanban complete {tid} --override-gate "
+                    f"--override-reason \"<why>\"` to proceed anyway — that override itself only "
+                    f"succeeds when run as the dave profile."
+                )
                 return False
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "

@@ -309,6 +309,12 @@ _SPECS = [
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
                   "even without owning its run (closes the worker's run)."),
+        _arg("--override-gate", action="store_true",
+             help="Override an unresolved gate-holder approval (fail-closed by default). "
+                  "Requires --override-reason, and only succeeds when run as the dave profile."),
+        _arg("--override-reason",
+             help="Required with --override-gate: why completion is proceeding without the "
+                  "gate-holder's recorded verdict. Logged on the task's event log."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,

@@ -2082,3 +2082,229 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+# ---------------------------------------------------------------------------
+# Gate enforcement in `kanban complete` (F-A, CWE-862)
+# ---------------------------------------------------------------------------
+
+
+def _mk_profile(home: Path, name: str) -> None:
+    """Minimal on-disk profile so list_profiles_on_disk()/gate holder
+    cross-checks resolve ``name`` as a known profile."""
+    d = home / "profiles" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+
+def test_gate_unmet_approval_no_marker_is_ungated(kanban_home):
+    """No gate language at all -> None (the common/unwritten-majority case)."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="plain card", body="Just do the thing.")
+        assert kb._gate_unmet_approval(conn, t) is None
+
+
+def test_gate_unmet_approval_prose_mention_without_prefix_is_ungated(kanban_home):
+    """Negative case the design calls out explicitly: body text that mentions
+    'Gate 1' in prose WITHOUT the literal 'Gated on' prefix must NOT block."""
+    with kbc.connect() as conn:
+        t = kb.create_task(
+            conn, title="prose mentions gate",
+            body="This work unblocks Gate 1 of the rollout plan eventually.",
+        )
+        assert kb._gate_unmet_approval(conn, t) is None
+
+
+def test_gate_unmet_approval_parent_marker_satisfied_by_approved_comment(kanban_home):
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        kb.add_comment(conn, gate_card, "stella", "Reviewed, APPROVED.")
+        assert kb.complete_task(conn, gate_card, result="reviewed")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Implements the feature. Gated on Stella Gate 1 ({gate_card}).",
+        )
+        assert kb._gate_unmet_approval(conn, t) is None
+
+
+def test_gate_unmet_approval_child_marker_satisfied_by_cleared_comment(kanban_home):
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="feature epic")
+        t = kb.create_task(conn, title="gated build card", parents=[parent])
+        gate_child = kb.create_task(
+            conn, title="Gate 2 for feature epic", assignee="stella", parents=[parent],
+        )
+        assert kb.complete_task(conn, parent, result="epic scaffolded")
+        kb.add_comment(conn, gate_child, "stella", "Security closure CLEARED.")
+        assert kb.complete_task(conn, gate_child, result="cleared")
+        assert kb._gate_unmet_approval(conn, t) is None
+
+
+def test_gate_unmet_approval_unresolved_when_gate_card_not_done(kanban_home):
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Stella Gate 1 approval ({gate_card}).",
+        )
+        with pytest.raises(kb.GateUnmetError) as exc_info:
+            kb._gate_unmet_approval(conn, t)
+    assert exc_info.value.reason.startswith("unresolved")
+    assert exc_info.value.holder == "Stella"
+    assert exc_info.value.card_ref_or_child == gate_card
+
+
+def test_gate_unmet_approval_parse_failure_when_holder_not_a_known_profile(kanban_home):
+    """Holder name that doesn't resolve to any on-disk profile -> parse_failure,
+    the SAME fail-closed bucket as unresolved (not a silent pass)."""
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Nobody Gate 1 review")
+        kb.complete_task(conn, gate_card, result="done")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Nobody Gate 1 ({gate_card}).",
+        )
+        with pytest.raises(kb.GateUnmetError) as exc_info:
+            kb._gate_unmet_approval(conn, t)
+    assert exc_info.value.reason.startswith("parse_failure")
+
+
+def test_complete_task_raises_gate_unmet_error_without_override(kanban_home):
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Stella Gate 1 ({gate_card}).",
+        )
+        with pytest.raises(kb.GateUnmetError):
+            kb.complete_task(conn, t, result="done anyway")
+        assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_override_gate_requires_dave_identity(kanban_home, monkeypatch):
+    """override_gate=True + a real reason but a NON-dave resolved identity
+    must still raise — the gate cannot be bypassed by just passing flags."""
+    _mk_profile(kanban_home, "stella")
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "alice")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Stella Gate 1 ({gate_card}).",
+        )
+        with pytest.raises(kb.GateUnmetError):
+            kb.complete_task(
+                conn, t, result="done anyway", override_gate=True, override_reason="urgent",
+            )
+        assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_override_gate_requires_non_empty_reason(kanban_home, monkeypatch):
+    _mk_profile(kanban_home, "stella")
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "dave")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Stella Gate 1 ({gate_card}).",
+        )
+        with pytest.raises(kb.GateUnmetError):
+            kb.complete_task(
+                conn, t, result="done anyway", override_gate=True, override_reason="   ",
+            )
+        assert kb.get_task(conn, t).status != "done"
+
+
+def test_complete_task_override_gate_as_dave_succeeds_and_logs_event(kanban_home, monkeypatch):
+    """dave + a real reason completes the card and records a distinct
+    ``gate_override`` event (not folded into ``completed``) with all four
+    payload fields, landing BEFORE the ``completed`` event."""
+    _mk_profile(kanban_home, "stella")
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "dave")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Stella Gate 1 ({gate_card}).",
+        )
+        assert kb.complete_task(
+            conn, t, result="shipped despite pending gate",
+            override_gate=True, override_reason="customer deadline",
+        )
+        assert kb.get_task(conn, t).status == "done"
+        events = kb.list_events(conn, t)
+        kinds = [e.kind for e in events]
+        assert "gate_override" in kinds
+        assert kinds.index("gate_override") < kinds.index("completed")
+        override_event = next(e for e in events if e.kind == "gate_override")
+        assert override_event.payload["holder"] == "Stella"
+        assert override_event.payload["card_ref_or_child"] == gate_card
+        assert override_event.payload["reason_bucket"] == "unresolved"
+        assert override_event.payload["gate_type"] == "1"
+        assert override_event.payload["override_reason"] == "customer deadline"
+        assert override_event.payload["overridden_by"] == "dave"
+
+
+def test_complete_task_ungated_card_unaffected_by_gate_wiring(kanban_home):
+    """Regression guard: every existing caller of complete_task must see ZERO
+    behavior change on cards with no gate marker."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="plain card", body="No gate language here.")
+        assert kb.complete_task(conn, t, result="done")
+        assert kb.get_task(conn, t).status == "done"
+        assert not any(e.kind == "gate_override" for e in kb.list_events(conn, t))
+
+
+def test_claim_task_rejects_body_marker_not_backed_by_parents_link(kanban_home):
+    """A ready card whose body names a gate with no matching parents[] entry
+    is rejected on claim, demoted to todo, with claim_rejected/gate_marker_not_linked —
+    mirroring the existing undone-parent path exactly."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Stella Gate 1 ({gate_card}).",
+        )
+        assert kb.get_task(conn, t).status == "ready"
+        claimed = kb.claim_task(conn, t)
+        assert claimed is None
+        assert kb.get_task(conn, t).status == "todo"
+        events = [e for e in kb.list_events(conn, t) if e.kind == "claim_rejected"]
+        assert events and events[-1].payload["reason"] == "gate_marker_not_linked"
+        assert events[-1].payload["ref"] == gate_card
+
+
+def test_claim_task_succeeds_once_gate_marker_is_linked(kanban_home):
+    """The same card, after `hermes kanban link <gate_id> <card_id>` (here
+    link_tasks) is run, claims successfully once the gate itself resolves."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Gated on Stella Gate 1 ({gate_card}).",
+        )
+        kb.link_tasks(conn, gate_card, t)
+        assert kb.get_task(conn, t).status == "todo"  # parent not done yet -> still gated by parents
+        kb.add_comment(conn, gate_card, "stella", "APPROVED.")
+        assert kb.complete_task(conn, gate_card, result="reviewed")
+        # Parent now done -> recompute_ready promotes the child back to ready.
+        assert kb.get_task(conn, t).status == "ready"
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.status == "running"
+
+
+def test_claim_task_with_no_gate_marker_is_unaffected(kanban_home):
+    """Zero regression on the common/ungated case: a plain ready card with no
+    gate marker at all claims unaffected."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="plain card", body="No gate language here.")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.status == "running"
