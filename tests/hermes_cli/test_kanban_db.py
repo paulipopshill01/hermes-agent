@@ -2156,6 +2156,34 @@ def test_comment_has_gate_verdict_rejects_negated_phrasing(rejection_text):
     assert kb._comment_has_gate_verdict(rejection_text) is False
 
 
+# --- Gate 2 finding 3 (Stella, round 2, 2026-11-21): negator separated from the verdict
+# token by a modifier word defeated the single-immediately-preceding-word check ---
+
+@pytest.mark.parametrize("rejection_text", [
+    "not yet approved",
+    "Not fully approved, needs another pass",
+    "This is definitely not really ever going to be approved",
+])
+def test_comment_has_gate_verdict_rejects_negation_with_intervening_modifier(rejection_text):
+    """A negator need not be the LITERAL word immediately before the verdict token --
+    realistic rejection phrasing often has a modifier (yet/fully/really/etc.) in between,
+    and that must still be recognized as a negated (non-satisfying) verdict."""
+    assert kb._comment_has_gate_verdict(rejection_text) is False
+
+
+@pytest.mark.parametrize("approval_text", [
+    "PLAN APPROVED",
+    "Security closure CLEARED.",
+    "no changes needed, APPROVED",
+    "Looks good so far, APPROVED pending tests.",
+])
+def test_comment_has_gate_verdict_still_accepts_true_approvals_near_unrelated_negators(approval_text):
+    """The widened negation window must not over-negate: a negation word in an earlier,
+    separate clause (closed off by punctuation) must not suppress a real verdict token that
+    follows it in its own clause."""
+    assert kb._comment_has_gate_verdict(approval_text) is True
+
+
 def test_gate_unmet_approval_parent_marker_unresolved_when_holder_comment_is_a_rejection(kanban_home):
     """End-to-end version of the same finding: a real rejection comment from the gate-holder
     must still block completion, not satisfy the gate."""

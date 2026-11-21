@@ -2987,26 +2987,35 @@ _GATE_NEGATION_WORDS = frozenset({
     "cannot", "can't", "cant", "without", "no",
 })
 
+# Gate 2 finding 3 (Stella, round 2, 2026-11-21): a single immediately-preceding-word check
+# missed realistic phrasings where a modifier sits between the negator and the verdict token
+# ("not yet approved", "Not fully approved, needs another pass"). Widen the scan to a short
+# backward WINDOW of words rather than just the literal adjacent one. The window is bounded
+# by the nearest clause boundary (sentence punctuation, comma, semicolon, colon, newline) so
+# a negator in an earlier, unrelated clause can't leak across and falsely negate a real
+# verdict (e.g. "no changes needed, APPROVED" must still register True: the comma closes the
+# clause before the negation word would otherwise be seen).
+_GATE_CLAUSE_BOUNDARY_RE = re.compile(r"[.!?\n,;:]")
+_GATE_NEGATION_WINDOW_WORDS = 6
 
-def _word_immediately_before(text: str, pos: int) -> str:
-    """The whitespace-delimited word ending right at ``pos`` in ``text`` (punctuation
-    stripped, lowercased), or '' if ``pos`` is at the start / preceded only by whitespace.
-    Used to classify what comes right before a verdict-token match -- a manual scan instead
-    of a regex lookbehind because the gap can be more than one space/newline wide, which a
-    fixed-width ``(?<!...)`` lookbehind cannot express."""
-    j = pos
-    while j > 0 and text[j - 1].isspace():
-        j -= 1
-    end = j
-    while j > 0 and not text[j - 1].isspace():
-        j -= 1
-    return text[j:end].strip(string.punctuation).lower()
+
+def _words_in_clause_before(text: str, pos: int, max_words: int = _GATE_NEGATION_WINDOW_WORDS) -> list[str]:
+    """Lowercased, punctuation-stripped words from the start of the current clause up to
+    ``pos``, most-recent-last, capped at ``max_words``. The "current clause" is whatever
+    follows the nearest clause-boundary character before ``pos`` (or the start of ``text``
+    if there is none) -- this keeps a negator in a prior clause/sentence from being treated
+    as modifying a verdict token in a later one."""
+    before = text[:pos]
+    boundaries = list(_GATE_CLAUSE_BOUNDARY_RE.finditer(before))
+    clause = before[boundaries[-1].end():] if boundaries else before
+    words = re.findall(r"[A-Za-z']+", clause)
+    return [w.strip(string.punctuation).lower() for w in words[-max_words:]]
 
 
 def _comment_has_gate_verdict(body: Optional[str]) -> bool:
     text = body or ""
     for m in _GATE_VERDICT_TOKEN_RE.finditer(text):
-        if _word_immediately_before(text, m.start()) in _GATE_NEGATION_WORDS:
+        if any(w in _GATE_NEGATION_WORDS for w in _words_in_clause_before(text, m.start())):
             continue
         return True
     return False
