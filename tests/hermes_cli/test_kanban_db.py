@@ -2142,6 +2142,89 @@ def test_gate_unmet_approval_child_marker_satisfied_by_cleared_comment(kanban_ho
         assert kb._gate_unmet_approval(conn, t) is None
 
 
+# --- Gate 2 finding 1 (Stella, 2026-11-21): negated-verdict substring false-positive ---
+
+@pytest.mark.parametrize("rejection_text", [
+    "Security review is pending - not cleared for merge",
+    "PLAN REVISION NEEDED - ... NOT APPROVED",
+    "DISAPPROVED: found critical vuln",
+    "Verdict: CHANGES REQUESTED. This build is not approved yet.",
+])
+def test_comment_has_gate_verdict_rejects_negated_phrasing(rejection_text):
+    """A holder's own honest rejection must never register as a satisfied verdict just
+    because a bare token like APPROVED/CLEARED is a substring of the negation."""
+    assert kb._comment_has_gate_verdict(rejection_text) is False
+
+
+def test_gate_unmet_approval_parent_marker_unresolved_when_holder_comment_is_a_rejection(kanban_home):
+    """End-to-end version of the same finding: a real rejection comment from the gate-holder
+    must still block completion, not satisfy the gate."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        kb.add_comment(conn, gate_card, "stella", "Reviewed — not cleared for merge yet.")
+        assert kb.complete_task(conn, gate_card, result="reviewed")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Implements the feature. Gated on Stella Gate 1 ({gate_card}).",
+        )
+        with pytest.raises(kb.GateUnmetError):
+            kb._gate_unmet_approval(conn, t)
+
+
+# --- Gate 2 finding 2 (Stella, 2026-11-21): any-comment-ever vs holder's latest comment ---
+
+def test_gate_unmet_approval_parent_marker_unresolved_when_latest_comment_supersedes_approval(kanban_home):
+    """An early 'approved pending tests' comment later superseded by the SAME holder's
+    'found a blocker, BLOCKED' must NOT satisfy the gate — only the latest comment counts."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        kb.add_comment(conn, gate_card, "stella", "Looks good so far, APPROVED pending tests.")
+        kb.add_comment(conn, gate_card, "stella", "Ran the tests myself — found a blocker, BLOCKED.")
+        assert kb.complete_task(conn, gate_card, result="reviewed")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Implements the feature. Gated on Stella Gate 1 ({gate_card}).",
+        )
+        with pytest.raises(kb.GateUnmetError):
+            kb._gate_unmet_approval(conn, t)
+
+
+def test_gate_unmet_approval_parent_marker_satisfied_when_latest_comment_is_the_approval(kanban_home):
+    """Inverse of the above: an early BLOCKED comment later superseded by the SAME holder's
+    APPROVED resubmission-review must satisfy the gate -- the latest comment wins either way,
+    not just a bias toward rejection."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        kb.add_comment(conn, gate_card, "stella", "Found a blocker, BLOCKED.")
+        kb.add_comment(conn, gate_card, "stella", "Re-reviewed after the fix — APPROVED.")
+        assert kb.complete_task(conn, gate_card, result="reviewed")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"Implements the feature. Gated on Stella Gate 1 ({gate_card}).",
+        )
+        assert kb._gate_unmet_approval(conn, t) is None
+
+
+def test_gate_unmet_approval_child_marker_unresolved_when_latest_comment_supersedes_approval(kanban_home):
+    """Same supersede-with-later-block case on the CHILD-marker branch, not just parent-side."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="feature epic")
+        t = kb.create_task(conn, title="gated build card", parents=[parent])
+        gate_child = kb.create_task(
+            conn, title="Gate 2 for feature epic", assignee="stella", parents=[parent],
+        )
+        assert kb.complete_task(conn, parent, result="epic scaffolded")
+        kb.add_comment(conn, gate_child, "stella", "Security closure CLEARED.")
+        kb.add_comment(conn, gate_child, "stella", "Correction after re-check — not cleared for merge.")
+        assert kb.complete_task(conn, gate_child, result="cleared")
+        with pytest.raises(kb.GateUnmetError):
+            kb._gate_unmet_approval(conn, t)
+
+
 def test_gate_unmet_approval_unresolved_when_gate_card_not_done(kanban_home):
     _mk_profile(kanban_home, "stella")
     with kbc.connect() as conn:

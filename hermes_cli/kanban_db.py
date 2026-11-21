@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import sqlite3
+import string
 import subprocess
 import sys
 import logging
@@ -2967,10 +2968,48 @@ _GATE_CHILD_TITLE_PREFIXES: tuple[str, ...] = (
     "stella gate 2:", "gate 2 for", "security closure:",
 )
 
-# Recognized verdict tokens, case-insensitive, anywhere in a comment body.
-# "PLAN APPROVED" is already covered by the plain "APPROVED" substring check
-# but is kept explicit to mirror the spec literally.
+# Recognized verdict tokens, case-insensitive, matched on real word boundaries (never a bare
+# substring — see _GATE_NEGATION_WORDS below for why boundaries alone aren't sufficient).
+# "PLAN APPROVED" is already covered by the plain "APPROVED" word match but is kept explicit
+# to mirror the spec literally.
 _GATE_VERDICT_TOKENS: tuple[str, ...] = ("APPROVED", "CLEARED", "PLAN APPROVED")
+_GATE_VERDICT_TOKEN_RE = re.compile(
+    r'\b(?:' + '|'.join(re.escape(t) for t in _GATE_VERDICT_TOKENS) + r')\b', re.IGNORECASE,
+)
+# Gate 2 finding 1 (Stella, 2026-11-21): a holder's own honest rejection comment
+# ("not cleared for merge", "NOT APPROVED", "not approved yet") must never register as a
+# satisfied verdict just because the bare token is a substring of the negation. Word
+# boundaries alone already defeat "DISAPPROVED" (no boundary between "DIS" and "APPROVED"
+# inside one unbroken word), but "NOT APPROVED"/"not approved yet"/"not cleared for merge"
+# have a REAL word boundary before the token, so those need an explicit preceding-word check.
+_GATE_NEGATION_WORDS = frozenset({
+    "not", "never", "non", "isn't", "isnt", "wasn't", "wasnt", "aren't", "arent",
+    "cannot", "can't", "cant", "without", "no",
+})
+
+
+def _word_immediately_before(text: str, pos: int) -> str:
+    """The whitespace-delimited word ending right at ``pos`` in ``text`` (punctuation
+    stripped, lowercased), or '' if ``pos`` is at the start / preceded only by whitespace.
+    Used to classify what comes right before a verdict-token match -- a manual scan instead
+    of a regex lookbehind because the gap can be more than one space/newline wide, which a
+    fixed-width ``(?<!...)`` lookbehind cannot express."""
+    j = pos
+    while j > 0 and text[j - 1].isspace():
+        j -= 1
+    end = j
+    while j > 0 and not text[j - 1].isspace():
+        j -= 1
+    return text[j:end].strip(string.punctuation).lower()
+
+
+def _comment_has_gate_verdict(body: Optional[str]) -> bool:
+    text = body or ""
+    for m in _GATE_VERDICT_TOKEN_RE.finditer(text):
+        if _word_immediately_before(text, m.start()) in _GATE_NEGATION_WORDS:
+            continue
+        return True
+    return False
 
 
 class GateUnmetError(ValueError):
@@ -2998,9 +3037,21 @@ class GateUnmetError(ValueError):
         super().__init__(f"completion blocked: {task_id} has an unresolved gate ({reason})")
 
 
-def _comment_has_gate_verdict(body: Optional[str]) -> bool:
-    upper = (body or "").upper()
-    return any(token in upper for token in _GATE_VERDICT_TOKENS)
+def _latest_comment_by(conn: sqlite3.Connection, task_id: str, author: str) -> Optional[Comment]:
+    """The most recent comment by ``author`` (case-insensitive) on ``task_id``, or None.
+
+    Gate 2 finding 2 (Stella, 2026-11-21): resolving via ``any(... for c in list_comments(...))``
+    scans the WHOLE comment thread and is satisfied by the holder's FIRST matching comment ever
+    posted, even if a later comment from the same holder supersedes it (e.g. an early "approved
+    pending tests" followed by "found a blocker, BLOCKED"). Only the holder's latest comment is
+    an authoritative current verdict. Ordered by (created_at, id) rather than trusting
+    ``list_comments``'s own sort alone -- ``id`` is the monotonic insertion-order tiebreaker for
+    a same-second comment burst (see ``list_comments_after``'s own docstring on this exact
+    point)."""
+    candidates = [c for c in list_comments(conn, task_id) if c.author and c.author.lower() == author.lower()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: (c.created_at, c.id))
 
 
 def _find_parent_gate_marker(body: Optional[str]) -> Optional[tuple[str, str, str]]:
@@ -3063,10 +3114,8 @@ def _gate_unmet_approval(conn: sqlite3.Connection, task_id: str) -> None:
                          f"(status={ref_task.status})",
                 holder=holder, card_ref_or_child=ref, gate_type=gate_n,
             )
-        if not any(
-            c.author and c.author.lower() == holder.lower() and _comment_has_gate_verdict(c.body)
-            for c in list_comments(conn, ref)
-        ):
+        latest = _latest_comment_by(conn, ref, holder)
+        if latest is None or not _comment_has_gate_verdict(latest.body):
             raise GateUnmetError(
                 task_id, f"unresolved: gate card {ref} has no verdict comment from {holder}",
                 holder=holder, card_ref_or_child=ref, gate_type=gate_n,
@@ -3089,10 +3138,8 @@ def _gate_unmet_approval(conn: sqlite3.Connection, task_id: str) -> None:
                          f"(status={child_task.status if child_task else 'missing'})",
                 holder=assignee, card_ref_or_child=child_id, gate_type=gate_n,
             )
-        if not any(
-            c.author and c.author.lower() == assignee.lower() and _comment_has_gate_verdict(c.body)
-            for c in list_comments(conn, child_id)
-        ):
+        latest = _latest_comment_by(conn, child_id, assignee)
+        if latest is None or not _comment_has_gate_verdict(latest.body):
             raise GateUnmetError(
                 task_id, f"unresolved: gate child {child_id} has no verdict comment from {assignee}",
                 holder=assignee, card_ref_or_child=child_id, gate_type=gate_n,
