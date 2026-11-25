@@ -53,7 +53,13 @@ SNAPSHOT_SCRUB_REL = "tools/environments/base_session_env.py"
 # attempt will correctly refuse (version drift) until they are realigned.
 PINNED_BLOB_REL = "hermes_cli/_security_pins/base_session_env.pinned"
 PINNED_BLOB_SHA256 = (
-    "3f1f481b4a3127dda2fddd38528599e86491d3cf8af39b42f2b170c0cf5314b7")
+    "deb548649dd06b7639cca1cdbc0ed93ebaefadfe323d26485448d3b3ba384a22")
+# Gate-2 pin bump (t_9dd1e607, 2026-11-25): 3 commits had drifted the pinned
+# blob (99373fd5b4, c231b5370a, a6ae3e94b1 -- all content-only changes to
+# tools/environments/base_session_env.py that the SENTINELS name-presence
+# check could not detect). Blob re-synced to the live file byte-for-byte and
+# this hash recomputed from it; see t_9dd1e607 and policy card t_20438626 for
+# the pin-maintenance contract this closes the drift gap on.
 
 # Sentinels that must be present on the live file for the guard to be considered
 # functional.  A grep on the symbol name is the right level: a white-box scan
