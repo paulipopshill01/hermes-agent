@@ -430,6 +430,18 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         digest = hashlib.sha256(task_id.encode()).hexdigest()[:16]
         return f"{self._snapshot_path[:-len('.sh')]}-{digest}.sh"
 
+    def _secret_dump_args(self) -> dict:
+        """Kwargs splatted into ``_snapshot_bootstrap_script``/``_wrap_command_script`` so a
+        backend with an in-memory secret channel (``LocalEnvironment``) can route named secrets
+        off the on-disk snapshot (#62336). Empty here: R-01's unconditional scrub stays the only
+        protection for every backend that does not override this."""
+        return {}
+
+    def _snapshot_write_path(self, login: bool) -> str:
+        """The snapshot file the script being spawned writes: the bootstrap always writes the
+        environment's own; a wrapped command writes its task's (``_shell_state_paths``)."""
+        return self._snapshot_path if login else self._shell_state_paths()[0]
+
     def _snapshot_script_kwargs(self, cwd: str, snap: str | None = None) -> dict:
         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.
         ``_quote_cwd_for_cd`` / ``_quote_shell_path`` (not bare shlex.quote) let the Windows
@@ -446,7 +458,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         under ``bash -l``. On failure, fall back to ``bash -l`` per command — unless a non-login
         probe shows login bash itself is dead, in which case prefer ``bash -c``."""
         bootstrap = _snapshot_bootstrap_script(
-            excluded_names=self._snapshot_excluded_passthrough_names(), **self._snapshot_script_kwargs(self.cwd))
+            excluded_names=self._snapshot_excluded_passthrough_names(), **self._snapshot_script_kwargs(self.cwd),
+            **self._secret_dump_args())
         try:
             proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
@@ -499,6 +512,12 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         rewrite native/mixed Windows paths to ``/c/...``; remote backends are POSIX."""
         return shlex.quote(path)
 
+    def _shell_state_paths(self) -> list[str]:
+        """Snapshot files this command reads, in source order; the first is the one it writes: the
+        task's own (``_task_snapshot_path``), then its delegation ancestors', then the env's own."""
+        chain = [self._task_snapshot_path(t) for t in _shell_state_chain.get()]
+        return [*chain, self._snapshot_path] if chain else [self._snapshot_path]
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
         chain = [self._task_snapshot_path(t) for t in _shell_state_chain.get()]
@@ -510,7 +529,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             persist_env=self._persist_env,
             pipe_marker=self._pipe_marker,
             seed_snaps=seeds,
-            **self._snapshot_script_kwargs(cwd, chain[0] if chain else None))
+            **self._snapshot_script_kwargs(cwd, chain[0] if chain else None),
+            **self._secret_dump_args())
 
     @staticmethod
     def _embed_stdin_heredoc(command: str, stdin_data: str) -> str:

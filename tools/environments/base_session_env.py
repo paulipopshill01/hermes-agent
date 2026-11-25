@@ -232,7 +232,114 @@ def _cwd_marker_printf(marker: str) -> str:
     return f"printf '\\n{marker}%s{marker}\\n' \"$(pwd -P)\""
 
 
-def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
+def _secret_fd_token(session_id: str) -> str:
+    """Unique placeholder substituted at run time with the secret handoff pipe FD."""
+    return f"__HERMES_SECRET_FD_{session_id}__"
+
+
+def _secret_gen_token(session_id: str) -> str:
+    """Unique placeholder substituted at run time with the secret generation id."""
+    return f"__HERMES_SECRET_GEN_{session_id}__"
+
+
+def _secret_restore_token(session_id: str) -> str:
+    """Unique placeholder substituted at run time with the restore pipe FD."""
+    return f"__HERMES_SECRET_RESTORE_{session_id}__"
+
+
+def _secret_src_token(session_id: str) -> str:
+    """Unique placeholder substituted at run time with the source snapshot FD."""
+    return f"__HERMES_SECRET_SRC_{session_id}__"
+
+
+# --- producer side of the in-memory secret handoff channel (upstream #62336) --------------
+# A backend with an in-memory secret channel (``LocalEnvironment``) gets ``secret_fd`` etc.
+# (see ``_secret_dump_args`` in base.py/local.py) and the dump below writes each secret
+# export's declaration to that fd instead of the file on disk; ``_secret_scrub_snippet``
+# above stays as the UNCONDITIONAL fail-closed backstop regardless of whether a handoff ran
+# (R-01, Viktor Finding 1/3, CWE-755) — a readonly export the handoff's `unset` cannot drop,
+# or a host with no handoff channel at all, is still caught before ``export -p`` runs.
+_SECRET_SHAPED_NAME_GLOBS = (
+    "*_TOKEN", "*_TOKENS", "TOKEN", "*AUTHTOKEN", "*_KEY", "KEY", "*APIKEY", "*PRIVATEKEY", "*_KEY_ID",
+    "*_ACCESS_KEY*", "*_CLIENT_ID", "*_SECRET", "*_SECRET_*", "SECRET", "*PASSWORD", "*_PASSWD", "PASSWD",
+    "*_PASS", "PASS", "*_PWD", "*_AUTH", "*_BEARER", "*_DSN", "*_CREDENTIAL*", "*_CREDS*", "*COOKIE*",
+    "*_WEBHOOK*")
+# Names whose value may embed ``user:pass@`` (``DATABASE_URL=postgres://u:***@db/app``): only these
+# have their VALUE checked, so the dump never reads every variable's value.
+_URL_SHAPED_NAME_GLOBS = ("*URL*", "*URI*", "*_DSN*", "*PROXY*", "*DATABASE*", "*CONN*", "*_HOST*")
+# A cheap superset of both lists for ``compgen -X``: bash tests every export against every pattern
+# there, and the exact lists above as per-letter classes cost ~5 ms of CPU per command. The loop
+# then applies the exact lists to the few names this lets through.
+_CANDIDATE_NAME_GLOBS = (
+    "*TOKEN*", "*KEY*", "*SECRET*", "*PASS*", "*PWD*", "*AUTH*", "*BEARER*", "*DSN*", "*CRED*",
+    "*COOKIE*", "*WEBHOOK*", "*_CLIENT_ID", "*UR[LI]*", "*PROXY*", "*DATABASE*", "*CONN*", "*_HOST*")
+
+
+def _any_case(glob: str) -> str:
+    """*glob* with every letter as a ``[Xx]`` class (bracket expressions kept as written, then
+    both cases of their letters), so ``compgen -X`` matches a name in any case: bash 3.2's
+    ``compgen -X`` ignores ``nocasematch``, which ``case`` honours on every version."""
+    return re.sub(r"\[([^]]*)\]|([A-Za-z])", lambda m: (
+        f"[{''.join(dict.fromkeys(c for ch in m[1] for c in (ch.upper(), ch.lower())))}]" if m[1] is not None
+        else f"[{m[2].upper()}{m[2].lower()}]"), glob)
+
+
+def _secret_handoff_snippet(secret_fd: str, secret_names: Iterable[str], generation: str) -> str:
+    """Dump-subshell lines that send each secret export to fd *secret_fd* and drop it, so the
+    ``export -p`` after them never puts the value in the file on disk. Each record is
+    ``NAME=<declare -p NAME>\\0`` (bash's own re-readable declaration, so arrays and the
+    readonly/integer/case attributes survive), one empty record closes the set, before the file is
+    published. The file's first line is ``__hermes_sgen=<generation>``: the backend opens the file
+    the next command will source, reads that line and hands the shell the open file plus that
+    dump's declarations only, so the two always come from the same dump.
+    A secret is a name the profile's ``.env``/secret sources define or the session ever held
+    (*secret_names*), a credential-shaped name (``_SECRET_SHAPED_NAME_GLOBS``, any case) or a
+    URL-shaped name whose value holds ``user:pass@``. One ``compgen -X`` picks the candidates inside
+    bash and every write is a builtin redirect, so the shell forks nothing per variable. ``export -n``
+    also clears a readonly export, which ``unset`` refuses — on a stubborn readonly, the fail-closed
+    scrub snippet below is what actually withholds the value from the published file. A failed write
+    still drops the value and withholds the closing record, so the backend keeps nothing from that
+    dump (fail closed: lost, never on disk). IFS / ``set -e`` are pinned: the user's command may have
+    changed either, or shadowed a command name.
+
+    This runs BEFORE ``_secret_scrub_snippet`` (R-01): the handoff is the primary path when a
+    channel exists (secrets survive to the next command, just not on disk), and the scrub is the
+    always-on net behind it, not a replacement for it.
+    """
+    names = sorted({n for n in secret_names if isinstance(n, str) and _SHELL_ENV_NAME_RE.fullmatch(n)})
+    secret = "|".join((*_SECRET_SHAPED_NAME_GLOBS, *names))
+    url = "|".join(_URL_SHAPED_NAME_GLOBS)
+    candidates = "|".join((*map(_any_case, _CANDIDATE_NAME_GLOBS), *names))
+    return (
+        "builtin set +e; builtin trap '' PIPE; builtin shopt -s extglob; "
+        "__hermes_ifs=${IFS-}; IFS=$'\\n'; __hermes_bad=; "
+        f"builtin printf '__hermes_sgen=%s\\n' {generation}; "
+        f"__hermes_c=$(builtin compgen -A export -X '!@({candidates})'); builtin shopt -s nocasematch; "
+        "for __hermes_v in $__hermes_c; do "
+        f'case "$__hermes_v" in {secret}) ;; {url}) '
+        'case "${!__hermes_v-}" in *://*:***@*) ;; *) continue ;; esac ;; *) continue ;; esac; '
+        "{ builtin printf '%s=' \"$__hermes_v\" && builtin declare -p \"$__hermes_v\" && builtin printf '\\0'; } "
+        f">&{secret_fd} 2>/dev/null || __hermes_bad=1; "
+        'builtin export -n "$__hermes_v"; builtin unset "$__hermes_v" 2>/dev/null; done; '
+        f"[ -z \"$__hermes_bad\" ] && builtin printf '\\0' >&{secret_fd} 2>/dev/null; "
+        "IFS=$__hermes_ifs; builtin unset __hermes_v __hermes_c __hermes_ifs __hermes_bad; ")
+
+
+def _secret_restore_lines(restore_fd: str) -> str:
+    """Run right after the snapshot is sourced: read the secret declarations the backend wrote to
+    fd *restore_fd* (a pipe, never process env: an escaped value doubles in ``declare -p`` and one
+    oversize env entry would make every later spawn fail) and ``eval`` them, then drop the marker.
+    ``read -d ''`` + ``eval``, not ``source /dev/fd/N``: bash 3.2 sources nothing from a pipe.
+    ``read`` returns 1 at the EOF it always reaches (the set holds no NUL), so ``|| :`` keeps an
+    inherited ``errexit`` from ending the command before it runs."""
+    return (
+        f"IFS= builtin read -r -d '' __hermes_d <&{restore_fd} || :; builtin eval \"${{__hermes_d-}}\"; "
+        "builtin unset __hermes_d __hermes_sgen")
+
+
+def _export_dump_excluding_session_vars(
+        tmp_path: str, excluded_names: Iterable[str] = (), *, secret_fd: str = "",
+        secret_names: Iterable[str] = (), secret_gen: str = "") -> str:
     """Shell snippet dumping ``export -p`` to *tmp_path* minus the per-session bridged vars (see
     ``_SNAPSHOT_EXCLUDED_ENV_REGEX``) and *excluded_names*. The vars are ``unset`` in a subshell
     BEFORE ``export -p``: a line-based ``grep -vE`` is unsafe because bash 3.2 prints a value
@@ -244,13 +351,18 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
 
     ``curl … | bash #`` smuggled into a Matrix room/display name via ``HERMES_SESSION_CHAT_NAME``) land in
     the snapshot and execute on the next ``source`` (issue #71296). Unsetting first means ``export -p``
-    never emits those vars — including any continuation lines.
+    never emits those vars — including any continuation lines. With *secret_fd* the secret exports
+    leave through that fd first (``_secret_handoff_snippet``, #62336); ``_secret_scrub_snippet`` (R-01)
+    then runs UNCONDITIONALLY regardless of *secret_fd* as the fail-closed backstop — a readonly
+    export the handoff could not ``unset``, or a host with no handoff channel at all, is still caught
+    here before ``export -p`` ever runs.
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are ignored
     # under 2>/dev/null. Caller names are quoted so malformed config can never
     # become shell syntax (valid names stay unquoted by shlex.quote()).
     safe_names = {name for name in excluded_names if isinstance(name, str) and name}
     extra_unset = "".join(f" {shlex.quote(name)}" for name in sorted(safe_names))
+    handoff = _secret_handoff_snippet(secret_fd, secret_names, secret_gen) if secret_fd else ""
     secret_scrub = _secret_scrub_snippet()
     return (
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
@@ -267,13 +379,20 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # on the backend and outlive the private dir it protects.
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
-        f"{secret_scrub}"
+        # Shell-option mirrors are read-only, so bash 3.2's ``declare -rx SHELLOPTS=…`` line fails
+        # on ``source`` and an inherited errexit then ends every later command; options are not
+        # environment the next command needs, so they stay out of the snapshot.
+        "builtin export -n SHELLOPTS BASHOPTS 2>/dev/null; "
+        f"{handoff}{secret_scrub}"
         "export -p; ) || true; } "
-        f"> {tmp_path}")
+        # ``>|``: the target is mktemp's existing file, which ``set -C`` would refuse with ``>``.
+        f">| {tmp_path}")
 
 
 def _snapshot_bootstrap_script(
     *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str, excluded_names: Iterable[str], cwd_marker: str,
+    secret_fd: str = "", secret_names: Iterable[str] = (), secret_gen: str = "", secret_src: str = "",
+    secret_restore: str = "",
 ) -> str:
     """Login-shell bootstrap that captures env/functions/aliases into the snapshot. Atomic publish:
     assemble in a ``mktemp`` file, then ``mv`` over the final path so a concurrent ``source`` never
@@ -282,11 +401,14 @@ def _snapshot_bootstrap_script(
     ``declare -F`` (a line-based ``declare -f | grep -v`` strips the header and leaves an orphaned
     body that breaks every sourced command); the non-empty guard matters because bare ``declare -f``
     dumps ALL functions. The trailing ``cd`` restores the configured cwd after profile scripts (e.g.
-    ``cd ~``) so ``pwd -P`` reports terminal.cwd, not the profile's directory."""
+    ``cd ~``) so ``pwd -P`` reports terminal.cwd, not the profile's directory. *secret_src*/
+    *secret_restore* are accepted (unused here) so the caller can splat the same
+    ``_secret_dump_args()`` dict into both this and ``_wrap_command_script`` uniformly — the login
+    bootstrap never sources a prior snapshot, so there is nothing to restore."""
     return (
         "umask 077\n"
         f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) || exit 1\n"
-        f"{_export_dump_excluding_session_vars(_SNAP_TMP, excluded_names)}\n"
+        f"{_export_dump_excluding_session_vars(_SNAP_TMP, excluded_names, secret_fd=secret_fd, secret_names=secret_names, secret_gen=secret_gen)}\n"
         "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
         f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> {_SNAP_TMP} 2>/dev/null || true\n"
         f"alias -p >> {_SNAP_TMP}\n"
@@ -323,7 +445,9 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
 def _wrap_command_script(
     command: str, *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str,
     passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
-    pipe_marker: str = "", persist_env: bool = True, seed_snaps: Iterable[str] = ()) -> str:
+    pipe_marker: str = "", persist_env: bool = True, seed_snaps: Iterable[str] = (),
+    secret_fd: str = "", secret_names: Iterable[str] = (),
+    secret_gen: str = "", secret_src: str = "", secret_restore: str = "") -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``persist_env=False`` skips the re-dump, so every command starts from the login-time
     snapshot and exports from one command never reach the next (the CWD marker still runs).
@@ -336,32 +460,41 @@ def _wrap_command_script(
     the user's command so snapshot files (which may carry secrets) are private without
     changing the command's umask. *seed_snaps* (quoted paths) are read, first existing wins,
     while *quoted_snap* does not exist yet: a delegated child's own snapshot starts as a copy of
-    its parent's shell state and its re-dump never writes the parent's file.
+    its parent's shell state and its re-dump never writes the parent's file. *secret_fd* is
+    closed for the user's command, so nothing it starts (``server &``) holds the channel open.
+    With *secret_src* the backend already opened the snapshot to source (its own, else the first
+    ancestor's) and the script reads that open file, never a newer one published meanwhile.
     """
     escaped = command.replace("'", "'\\''")
     capture = bool(pipe_marker) and _can_capture_pipestatus(command)
     save, restore = _passthrough_save_restore(passthrough_names)
     parts = list(save)
     seeds = list(seed_snaps)
-    if snapshot_ready and seeds:
+    if snapshot_ready and secret_src:
+        parts += [f"source /dev/fd/{secret_src} >/dev/null 2>&1 || true", _secret_restore_lines(secret_restore)]
+    elif snapshot_ready and seeds:
         parts.append(
             f"for __hermes_s in {quoted_snap} {' '.join(seeds)}; do "
             'if [ -f "$__hermes_s" ]; then source "$__hermes_s" >/dev/null 2>&1 || true; break; fi; done')
     elif snapshot_ready:
         parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
     parts += restore
+    run = _eval_capturing_pipestatus(escaped) if capture else f"eval '{escaped}'"
     parts += [
         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
         'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',
         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
         f"builtin cd -- {quoted_cwd} || exit 126",
-        _eval_capturing_pipestatus(escaped) if capture else f"eval '{escaped}'",
+        f"{run} {secret_fd}>&-{f' {secret_src}>&- {secret_restore}<&-' if snapshot_ready and secret_src else ''}"
+        if secret_fd else run,
         "__hermes_ec=$?",
         "umask 077"]
     if snapshot_ready and persist_env:
+        dump = _export_dump_excluding_session_vars(
+            _SNAP_TMP, passthrough_names, secret_fd=secret_fd, secret_names=secret_names, secret_gen=secret_gen)
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
-            f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "
+            f"{{ {dump} "
             f"&& {_snapshot_publish_guard(_SNAP_TMP)} "
             f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
