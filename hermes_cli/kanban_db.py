@@ -3274,8 +3274,15 @@ _GATE_REQUIRED_KEYWORD_PATTERNS: tuple[str, ...] = (
     r"\bauthenticat\w*", r"\bauthoriz\w*", r"\bauthoris\w*",
     r"\binput[-_ ]?validation\w*",
     r"\bsanitiz\w*", r"\bsanitis\w*",
-    # exclude "dependency injection" (keep SQL/command/prompt/code injection)
-    r"(?<!dependency )(?<!dependency-)(?<!dependency_)\binjection\w*",
+    # exclude "dependency injection" and its constructor/setter/method/field
+    # compounds (DI jargon, never security-relevant); keep SQL/command/
+    # prompt/code injection (N-1, CWE-185, t_897dc096 Viktor re-attestation).
+    r"(?<!dependency )(?<!dependency-)(?<!dependency_)"
+    r"(?<!constructor )(?<!constructor-)(?<!constructor_)"
+    r"(?<!setter )(?<!setter-)(?<!setter_)"
+    r"(?<!method )(?<!method-)(?<!method_)"
+    r"(?<!field )(?<!field-)(?<!field_)"
+    r"\binjection\w*",
     r"\bxss\b", r"\bcsrf\b",
     r"\bpii\b", r"\bpersonal[-_ ]?data\b", r"\bpersonally[-_ ]?identifiable\w*",
     r"\bexternal[-_ ]?api\w*", r"\bthird[-_ ]?party[-_ ]?api\w*", r"\bwebhook\w*",
@@ -3294,6 +3301,15 @@ _GATE_REQUIRED_KEYWORD_PATTERNS: tuple[str, ...] = (
     r"\btraversal\w*", r"\bssrf\w*", r"\bxxe\w*", r"\bdeserializ\w*", r"\bpickle\w*",
     r"\bcve\w*", r"\bsupply[-_ ]?chain\w*", r"\bdockerfile\w*",
     r"\bbase[-_ ]?image\w*", r"\bimage[-_ ]?digest\w*",
+    # --- N-3 fix (CWE-1039, t_897dc096 Viktor re-attestation): bare-upload
+    # drop left the info-disclosure/exposure/directory-listing family with no
+    # keyword. Measured live-board FP pressure before adding (2026-11-27,
+    # 820-card corpus, read-only): exposure\w* 5/820 new flags (0.61%, all
+    # genuine security/ops cards, well under the ~2% ceiling); disclosure\w*
+    # and directory[-_]?listing\w* 0 new flags (fully subsumed by existing
+    # stems on this corpus). AC-2 regression case restored: "exposure of
+    # uploaded files" now flags True.
+    r"\bexposure\w*", r"\bdisclosure\w*", r"\bdirectory[-_ ]?listing\w*",
 )
 # Kept for any external/introspective callers that expect the historical
 # flat-keyword name; no longer used to build the regex (each pattern above

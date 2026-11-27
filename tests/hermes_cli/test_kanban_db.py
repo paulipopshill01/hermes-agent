@@ -2484,6 +2484,52 @@ def test_looks_gate_required_false_positive_regression_f2(title, body):
     assert kb._looks_gate_required(title, body) is False
 
 
+# --- N-1 fix regression (t_deb5e68a, Viktor re-attestation t_897dc096):
+# injection lookbehind was DI-half-killed -- "dependency injection" was
+# excluded but "constructor injection" (and setter/method/field injection)
+# still flagged. Extended the lookbehind chain; zero FN risk since these
+# compounds are never security-relevant.
+
+@pytest.mark.parametrize("title,body", [
+    ("Dependency injection cleanup", ""),
+    ("", "constructor injection refactor"),
+    ("Constructor-injection pattern", ""),
+    ("Use constructor_injection style", ""),
+    ("Prefer setter injection here", ""),
+    ("Method injection in the DI container", ""),
+    ("Field injection is discouraged", ""),
+])
+def test_looks_gate_required_false_positive_regression_n1(title, body):
+    assert kb._looks_gate_required(title, body) is False
+
+
+@pytest.mark.parametrize("title,body", [
+    ("SQL injection in the login", ""),
+    ("prompt injection on the assistant", ""),
+    ("XML external entity injection fix", ""),
+])
+def test_looks_gate_required_true_positive_injection_n1(title, body):
+    assert kb._looks_gate_required(title, body) is True
+
+
+# --- N-3 fix regression (t_deb5e68a, Viktor re-attestation t_897dc096):
+# info-disclosure/exposure/directory-listing family restored after the
+# bare-upload drop removed its only (accidental) coverage. Measured FP
+# pressure on the live 820-card board before adding: exposure\w* 0.61% new
+# flags, disclosure\w* and directory-listing\w* 0% -- all well under the
+# ~2% ceiling, so added rather than just documented.
+
+@pytest.mark.parametrize("title,body", [
+    ("Block directory listing on static files", "exposure of uploaded files"),
+    ("Fix info disclosure in error messages", ""),
+    ("Directory-listing enabled on static assets", ""),
+    ("directory_listing misconfiguration", ""),
+])
+def test_looks_gate_required_true_positive_info_disclosure_n3(title, body):
+    assert kb._looks_gate_required(title, body) is True
+
+
+
 # F-1: previously-missed categories + form variants (AC-2/AC-3 in the report).
 
 @pytest.mark.parametrize("title,body", [
