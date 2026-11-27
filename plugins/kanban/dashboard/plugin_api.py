@@ -599,29 +599,38 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
 
 
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
-# payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
-# detection) and ``done`` pass ``force=True``: a dashboard action is a human override of a live worker claim.
+# payload, force) -> ok. ``review`` uses request_review (never a block, so it can't trip
+# unblock-loop detection) and always passes ``force=True`` regardless of the caller's ``force``
+# — that handler's own live-claim semantics are out of scope for this fence (see plan
+# 2026-11-27-bulk-clearance-gate-audit.md, Task 3). ``done`` now honors the caller's ``force``:
+# a single-card dashboard action is a human override of a live worker claim (force=True, the
+# prior behavior), but a bulk sweep must NOT silently override a live claim — it should skip
+# that row and report the refusal like any other per-id bulk failure (force=False).
 _STATUS_HANDLERS: dict[str, Any] = {
-    "done": lambda conn, tid, p: kanban_db.complete_task(
-        conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
-    "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
-    "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
-    "review": lambda conn, tid, p: kanban_db.request_review(
+    "done": lambda conn, tid, p, force: kanban_db.complete_task(
+        conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=force),
+    "blocked": lambda conn, tid, p, force: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "scheduled": lambda conn, tid, p, force: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "review": lambda conn, tid, p, force: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
-    "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
-    "todo": lambda conn, tid, p: _drag_to(conn, tid, "todo"),
-    "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage")}
+    "ready": lambda conn, tid, p, force: _drag_to(conn, tid, "ready"),
+    "todo": lambda conn, tid, p, force: _drag_to(conn, tid, "todo"),
+    "triage": lambda conn, tid, p, force: _drag_to(conn, tid, "triage")}
 
 
-def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
+def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str, force: bool = True) -> bool:
     """Dispatch a status verb; raises ``_StatusRejected`` (user-facing message)
-    for ``running`` or an unknown status (``unknown_detail``)."""
+    for ``running`` or an unknown status (``unknown_detail``). ``force`` (default True,
+    the pre-existing single-card behavior) is threaded to the ``done`` handler only — see
+    _STATUS_HANDLERS comment. The bulk call site passes ``force=False`` explicitly so a
+    live-claimed row raises LiveClaimError instead of being force-closed underneath its
+    worker (F-A3 / t_0bb1dafe Task 3)."""
     if s == "running":
         raise _StatusRejected(_RUNNING_DIRECT_MSG)
     handler = _STATUS_HANDLERS.get(s)
     if handler is None:
         raise _StatusRejected(unknown_detail)
-    return handler(conn, task_id, p)
+    return handler(conn, task_id, p, force)
 
 
 def _set_priority(conn, task_id: str, priority: int, board: Optional[str]) -> None:
@@ -850,7 +859,11 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
-        if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
+        # force=False: a bulk sweep must not silently override a live worker claim on
+        # 'done' (see _STATUS_HANDLERS comment / F-A3, t_0bb1dafe Task 3) — a live-claimed
+        # row raises LiveClaimError here, caught by bulk_update's per-id try/except below
+        # into this same refusal-reporting path, same as any other per-id bulk failure.
+        if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}", force=False):
             entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
     if payload.assignee is not None:
         try:
