@@ -98,7 +98,15 @@ def _activate_root_inline(
         return False
     run_id = kb._synthesize_ended_run(conn, root_id, outcome="completed", summary=summary, metadata=metadata)
     kb._append_event(
-        conn, root_id, "completed", {"result_len": 0, "summary": summary[:400] or None}, run_id=run_id,
+        conn, root_id, "completed",
+        {
+            "result_len": 0,
+            "summary": summary[:400] or None,
+            # R-2 (CWE-778, Viktor round-1 re-review t_6f3221d4): this was
+            # the one completed-event producer missing completed_by.
+            "completed_by": kb._resolved_caller_identity(),
+        },
+        run_id=run_id,
     )
     return True
 

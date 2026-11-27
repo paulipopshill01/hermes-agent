@@ -2688,3 +2688,24 @@ def test_synthesize_ended_run_metadata_carries_completed_by(kanban_home, monkeyp
         import json as _json
         meta = _json.loads(row["metadata"])
         assert meta["completed_by"] == "dave"
+
+
+def test_synthesize_ended_run_completed_by_is_not_caller_spoofable(kanban_home, monkeypatch):
+    """R-1 (CWE-807, Viktor round-1 re-review t_6f3221d4): a completing
+    caller's own free-form completion metadata must never override the
+    resolved identity on the run row — unconditional write, not setdefault."""
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "alice")
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="never claimed", assignee="forge")
+        assert kb.complete_task(
+            conn, t, result="done", summary="worker handoff",
+            metadata={"completed_by": "dave"},
+        )
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (t,),
+        ).fetchone()
+        assert row is not None
+        import json as _json
+        meta = _json.loads(row["metadata"])
+        assert meta["completed_by"] == "alice"
+        assert meta["completed_by"] != "dave"

@@ -49,6 +49,29 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
         conn.close()
 
 
+def test_create_swarm_root_completed_event_carries_completed_by(tmp_path, monkeypatch):
+    """R-2 (CWE-778, Viktor round-1 re-review t_6f3221d4): the swarm root's
+    inline blocked->done activation emits a completed event missing
+    completed_by -- the one completed-event producer that was missed."""
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "swarm-operator")
+    conn = kbc.connect(tmp_path / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="Map the target market and produce a decision memo.",
+            workers=[
+                SwarmWorkerSpec(profile="researcher-a", title="Market scan", body="Find competitors"),
+            ],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            created_by="orchestrator",
+        )
+        completed = [e for e in kb.list_events(conn, created.root_id) if e.kind == "completed"][-1]
+        assert completed.payload.get("completed_by") == "swarm-operator"
+    finally:
+        conn.close()
+
+
 def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ):

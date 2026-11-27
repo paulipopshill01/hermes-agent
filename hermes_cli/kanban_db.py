@@ -2098,7 +2098,11 @@ def _synthesize_ended_run(
     step_key = trow["current_step_key"] if trow else None
     if outcome == "completed":
         metadata = dict(metadata) if isinstance(metadata, dict) else {}
-        metadata.setdefault("completed_by", _resolved_caller_identity())
+        # R-1 (CWE-807, Viktor round-1 re-review t_6f3221d4): unconditional
+        # write, NOT setdefault — a completing caller's own free-form
+        # completion metadata must never be able to pre-set this key and
+        # have it survive; the resolved identity always wins.
+        metadata["completed_by"] = _resolved_caller_identity()
     cur = conn.execute(
         """
         INSERT INTO task_runs (
