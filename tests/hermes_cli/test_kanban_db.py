@@ -2419,3 +2419,146 @@ def test_claim_task_with_no_gate_marker_is_unaffected(kanban_home):
         claimed = kb.claim_task(conn, t)
         assert claimed is not None
         assert claimed.status == "running"
+
+
+# --- F-A2 (gate marker-tagging discipline, follow-up to CWE-862/F-A) ---
+# Plan 2026-11-27-gate-marker-tagging-discipline.md, Gate 1 cleared by Stella
+# (SHA cce053a3808cbd6a01f164d94a6c95ee348bd442ce3434a5c4e248eaffdc682c).
+
+# Task 3: _looks_gate_required is a PURE keyword classifier -- true positive,
+# true negative, and the critical negative (sibling gate card present but no
+# body marker) belongs to gate_audit_violation, NOT this function (Amendment A1).
+
+@pytest.mark.parametrize("title,body", [
+    ("Add OAuth login flow", "Implements the auth handshake."),
+    ("Rotate the API credential", "Needs a new secret in the vault."),
+    ("Payment webhook handler", "Handles Stripe webhook callbacks."),
+    ("Bump the Docker image tag", "New base image for the service."),
+    ("Add a DB migration", "Adds a schema change for the new column."),
+    ("Store user PII safely", "Captures personally identifiable fields."),
+])
+def test_looks_gate_required_true_positive_keyword_match(title, body):
+    assert kb._looks_gate_required(title, body) is True
+
+
+@pytest.mark.parametrize("title,body", [
+    ("Fix a typo in the README", "No security-sensitive content here."),
+    ("This unblocks Gate 1 of the rollout plan eventually", "Just prose mentioning gates."),
+    ("Refactor the sorting helper", "Pure function, no side effects, straightforward rename."),
+    ("", ""),
+    (None, None),
+])
+def test_looks_gate_required_true_negative_no_keyword(title, body):
+    assert kb._looks_gate_required(title, body) is False
+
+
+def test_looks_gate_required_is_pure_no_db_access_needed():
+    """No connection object is ever passed -- confirms the function signature
+    stays DB-free per Amendment A1, independent of any fixture."""
+    assert kb._looks_gate_required("Add auth check", "plain body") is True
+    assert kb._looks_gate_required("plain title", "plain body") is False
+
+
+# Task 4: gate_audit_violation / run_gate_audit assemble the real predicate,
+# including the sibling-gate-card suppression case Amendment A1 moved here.
+
+def test_gate_audit_violation_flags_keyword_match_with_no_marker(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="Add OAuth login", body="New auth flow, no gate yet.")
+        v = kb.gate_audit_violation(conn, t)
+        assert v is not None
+        assert v["task_id"] == t
+
+
+def test_gate_audit_violation_none_for_plain_card(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="Fix a typo", body="Nothing security-sensitive.")
+        assert kb.gate_audit_violation(conn, t) is None
+
+
+def test_gate_audit_violation_none_when_parent_marker_present(kanban_home):
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="Add OAuth login",
+            body=f"New auth flow. Gated on Stella Gate 1 ({gate_card}).",
+        )
+        assert kb.gate_audit_violation(conn, t) is None
+
+
+def test_gate_audit_violation_none_when_sibling_gate_card_present_with_no_body_marker(kanban_home):
+    """The critical negative case (Amendment A1): a sibling gate-review card
+    under the same parent, with NO body marker at all on the gated card,
+    must NOT be flagged -- the DB-fact suppression this function exists for."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="feature epic")
+        t = kb.create_task(
+            conn, title="Add OAuth login", body="New auth flow, no body marker.",
+            parents=[parent],
+        )
+        kb.create_task(
+            conn, title="Gate 2 for feature epic", assignee="stella", parents=[parent],
+        )
+        assert kb.gate_audit_violation(conn, t) is None
+
+
+def test_gate_audit_violation_none_when_acked(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="Add OAuth login", body="New auth flow.")
+        assert kb.gate_audit_violation(conn, t) is not None
+        kb.record_gate_ack_none(conn, t, reason="internal tool, no external exposure")
+        assert kb.gate_audit_violation(conn, t) is None
+
+
+def test_record_gate_ack_none_logs_identity_reason_and_ts(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "ada")
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="Add auth check", body="plain")
+        kb.record_gate_ack_none(conn, t, reason="reviewed informally, low risk")
+        events = [e for e in kb.list_events(conn, t) if e.kind == "gate_ack_none"]
+        assert len(events) == 1
+        assert events[0].payload["identity"] == "ada"
+        assert events[0].payload["reason"] == "reviewed informally, low risk"
+        assert isinstance(events[0].payload["ts"], int)
+
+
+def test_run_gate_audit_scoped_to_ids(kanban_home):
+    with kbc.connect() as conn:
+        flagged = kb.create_task(conn, title="Add OAuth login", body="auth flow")
+        clean = kb.create_task(conn, title="Fix a typo", body="nothing sensitive")
+        not_scanned = kb.create_task(conn, title="Add a secret handler", body="credential stuff")
+        violations = kb.run_gate_audit(conn, ids=[flagged, clean])
+        ids_found = {v["task_id"] for v in violations}
+        assert ids_found == {flagged}
+        assert not_scanned not in ids_found
+
+
+def test_run_gate_audit_full_board_finds_every_violation(kanban_home):
+    with kbc.connect() as conn:
+        flagged1 = kb.create_task(conn, title="Add OAuth login", body="auth flow")
+        flagged2 = kb.create_task(conn, title="Add a secret handler", body="credential stuff")
+        clean = kb.create_task(conn, title="Fix a typo", body="nothing sensitive")
+        violations = kb.run_gate_audit(conn)
+        ids_found = {v["task_id"] for v in violations}
+        assert flagged1 in ids_found
+        assert flagged2 in ids_found
+        assert clean not in ids_found
+
+
+def test_run_gate_audit_since_excludes_untouched_old_tasks(kanban_home):
+    with kbc.connect() as conn:
+        old = kb.create_task(conn, title="Add OAuth login", body="auth flow, old card")
+        cutoff = int(time.time()) + 10
+        violations_before_cutoff = kb.run_gate_audit(conn, since=0)
+        assert any(v["task_id"] == old for v in violations_before_cutoff)
+        violations_after_cutoff = kb.run_gate_audit(conn, since=cutoff)
+        assert not any(v["task_id"] == old for v in violations_after_cutoff)
+
+
+# Task 5: HARD fail-closed bulk pre-flight (CLI-level, hermes_cli/kanban.py)
+# is exercised in tests/hermes_cli/test_kanban_cli.py; the DB-layer tests
+# here just confirm the underlying audit primitive run_gate_audit(ids=...)
+# the pre-flight is built on, already covered above.
+

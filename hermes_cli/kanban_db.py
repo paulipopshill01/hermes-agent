@@ -3221,6 +3221,146 @@ def _gate_marker_matches_parents(conn: sqlite3.Connection, task_id: str) -> Opti
     return ref
 
 
+# --- Gate marker-tagging discipline (F-A2, follow-up to CWE-862/F-A) ---
+#
+# `_gate_unmet_approval`'s "no marker at all -> no raise" behaviour (above)
+# is deliberate and UNCHANGED by this section. What follows is an audit
+# layer on top: a pure keyword classifier for "this card probably deserved
+# a gate marker", a read-only `gate-audit` scan that assembles the real
+# violation predicate (DB facts included), an exemption ledger for
+# explicit "no gate needed" acks, and the HARD fail-closed bulk pre-flight
+# wired into `kanban complete` (hermes_cli/kanban.py:_cmd_complete).
+#
+# Task 1 (events-table shape): `task_events.payload` is a schema-free JSON
+# TEXT column (see CREATE TABLE above + `_append_event`/`Event.from_row`) --
+# the new `gate_ack_none` event kind below needs NO migration, same as
+# every other event kind in this file.
+
+# Viktor-curated security-keyword taxonomy (Task 2, plan
+# 2026-11-27-gate-marker-tagging-discipline.md, Gate 1 SHA
+# cce053a3808cbd6a01f164d94a6c95ee348bd442ce3434a5c4e248eaffdc682c).
+# DRAFT pending Viktor's explicit sign-off on the Security closure card
+# this build spawns -- IS the enforcement surface (too narrow = silent
+# slips, too broad = reflexive --ack-no-gate normalizes the blind spot
+# instead of closing it). Do not edit without going back through that
+# review.
+_GATE_REQUIRED_KEYWORDS: tuple[str, ...] = (
+    "auth", "authentication", "authorization", "authn", "authz",
+    "input validation", "sanitiz", "injection", "xss", "csrf",
+    "pii", "personal data", "personally identifiable",
+    "external api", "third-party api", "third party api", "webhook",
+    "file upload", "upload",
+    "secret", "credential", "api key", "apikey", "token", "password",
+    "private key", "encryption key",
+    "docker image", "docker tag", "container image",
+    "migration", "schema change", "schema migration",
+    "payment", "billing", "card number", "pci", "credit card",
+)
+_GATE_REQUIRED_KEYWORD_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k in _GATE_REQUIRED_KEYWORDS) + r")\w*",
+    re.IGNORECASE,
+)
+
+
+def _looks_gate_required(title: Optional[str], body: Optional[str]) -> bool:
+    """Pure heuristic classifier (Task 3): does ``title``/``body`` mention a
+    security-sensitive keyword from the Task 2 taxonomy? No DB access, no
+    marker/sibling-card/ack lookup here by design (Amendment A1 / Gate 1,
+    Stella 2026-11-27): the "a sibling gate-review card already exists, so
+    this isn't really a violation" case is a DB FACT and belongs in
+    :func:`gate_audit_violation` below, not in this pure classifier, so
+    this function stays unit-testable in total isolation.
+    """
+    text = f"{title or ''}\n{body or ''}"
+    return bool(_GATE_REQUIRED_KEYWORD_RE.search(text))
+
+
+def record_gate_ack_none(conn: sqlite3.Connection, task_id: str, *, reason: str) -> None:
+    """Record an explicit 'no gate needed' exemption (Task 6, creation/edit
+    ``--ack-no-gate <reason>``). Caller identity is resolved the same way as
+    every other gate audit trail here (:func:`_resolved_caller_identity`) --
+    never a caller-supplied identity string. This is advisory bookkeeping
+    only: recording it never blocks or unblocks anything by itself; it is
+    read back by :func:`gate_audit_violation` to suppress an otherwise-true
+    heuristic match.
+    """
+    identity = _resolved_caller_identity()
+    with write_txn(conn):
+        _append_event(conn, task_id, "gate_ack_none", {
+            "identity": identity, "reason": reason, "ts": int(time.time()),
+        })
+
+
+def _has_gate_ack_none(conn: sqlite3.Connection, task_id: str) -> bool:
+    return any(e.kind == "gate_ack_none" for e in list_events(conn, task_id))
+
+
+def gate_audit_violation(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Assembled violation predicate (Task 4 / Amendment A1): classifier-true
+    AND no parent-side body marker AND no sibling gate-review card AND no
+    exemption ack on record. Returns a violation dict (``task_id``,
+    ``title``, ``status``, ``assignee``) or ``None`` when the card is clean
+    (not gate-worthy, already tagged, structurally gated, or acked).
+
+    This -- not :func:`_looks_gate_required` -- is where the "sibling
+    gate-review card present with no body marker" false-positive-avoidance
+    case lives, per Amendment A1: it needs DB access
+    (:func:`_find_child_gate_marker`) that the pure classifier deliberately
+    does not have.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    if not _looks_gate_required(task.title, task.body):
+        return None
+    if _find_parent_gate_marker(task.body) is not None:
+        return None
+    if _find_child_gate_marker(conn, task_id) is not None:
+        return None
+    if _has_gate_ack_none(conn, task_id):
+        return None
+    return {
+        "task_id": task_id, "title": task.title, "status": task.status,
+        "assignee": task.assignee,
+    }
+
+
+def run_gate_audit(
+    conn: sqlite3.Connection, *, ids: Optional[Iterable[str]] = None,
+    since: Optional[int] = None,
+) -> list[dict]:
+    """Read-only scan (Task 4). ``ids`` scopes the scan to exactly those ids
+    (bulk pre-flight use); otherwise every task is scanned, optionally
+    narrowed to drift since ``since`` (epoch seconds) -- a task counts as
+    "since" when it was CREATED after that time, or has ANY event recorded
+    after it (status changes, comments, edits, ...), since the schema has
+    no dedicated ``status_changed_at`` column (Task 1: no migration). This
+    is a superset-safe approximation for a drift scan: it can only report a
+    card as "since" too eagerly (extra event noise), never miss a real
+    change. Deterministic ``task_id`` order for stable ``--json`` diffs.
+    """
+    if ids is not None:
+        task_ids = list(dict.fromkeys(ids))
+    elif since is not None:
+        rows = conn.execute(
+            "SELECT DISTINCT t.id FROM tasks t "
+            "LEFT JOIN task_events e ON e.task_id = t.id AND e.created_at >= ? "
+            "WHERE t.created_at >= ? OR e.id IS NOT NULL "
+            "ORDER BY t.id",
+            (since, since),
+        ).fetchall()
+        task_ids = [r["id"] for r in rows]
+    else:
+        rows = conn.execute("SELECT id FROM tasks ORDER BY id").fetchall()
+        task_ids = [r["id"] for r in rows]
+    violations = []
+    for tid in task_ids:
+        v = gate_audit_violation(conn, tid)
+        if v is not None:
+            violations.append(v)
+    return violations
+
+
 def _stage_completion_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: dict, now: int, *,
     uploaded_by: str = "kanban_complete",

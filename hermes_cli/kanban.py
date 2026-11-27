@@ -381,6 +381,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+        ack_reason = getattr(args, "ack_no_gate", None)
+        if ack_reason:
+            kb.record_gate_ack_none(conn, task_id, reason=ack_reason)
+        elif kb.gate_audit_violation(conn, task_id) is not None:
+            # Soft warn only (Task 6 / Gate 1 resolution): creation-time is never
+            # blocked by the heuristic -- the hard check lives at the bulk
+            # complete pre-flight. Routed to stderr so --json stdout stays parseable.
+            print(
+                f"⚠  kanban: {task_id} looks gate-required (security keyword match) but has "
+                "no gate marker, sibling gate-review card, or --ack-no-gate exemption. Add a "
+                "'Gated on <holder>'s Gate <N> (<ref>)' body marker, link a sibling gate-review "
+                f"card, or re-run `hermes kanban edit {task_id} --ack-no-gate \"<reason>\"`.",
+                file=sys.stderr,
+            )
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
@@ -945,6 +959,34 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     metadata, rc = _parse_metadata_flag(raw_meta)
     if rc:
         return rc
+    # --- F-A2 Task 5: HARD fail-closed bulk pre-flight ---
+    # Only a real bulk close (2+ ids) trips this -- a single deliberate
+    # `complete <id>` is already covered by the existing (unchanged)
+    # per-card `_gate_unmet_approval` marker enforcement below; the risk
+    # this closes is silent BOARD-CLEARANCE sweeps, not one operator
+    # closing one card they're looking at (Task 6 rationale, Gate 1).
+    # Fail-closed, whole-batch abort, BEFORE any `complete_task` call --
+    # each id commits independently inside `_bulk_apply`, so this must be
+    # a distinct pass or a partial write leaks past the abort.
+    if len(ids) > 1:
+        with kbc.connect_closing() as audit_conn:
+            violations = kb.run_gate_audit(audit_conn, ids=ids)
+        if violations:
+            override_gate = bool(getattr(args, "override_gate", False))
+            override_reason = getattr(args, "override_reason", None)
+            reason_text = str(override_reason).strip() if override_reason else ""
+            identity = kb._resolved_caller_identity()
+            if not (override_gate and reason_text and identity == "dave"):
+                detail = "; ".join(f"{v['task_id']} ({v['title']!r})" for v in violations)
+                return _err(
+                    f"kanban: bulk complete aborted -- gate-audit flagged {len(violations)} of "
+                    f"{len(ids)} ids as probably gate-required with no marker/sibling card/ack: "
+                    f"{detail}. NONE of the {len(ids)} ids were touched (fail-closed, no partial "
+                    "completion). Add a gate marker / sibling gate-review card / "
+                    "`kanban edit <id> --ack-no-gate \"<reason>\"` to each flagged id, or resubmit "
+                    "the WHOLE batch with --override-gate --override-reason \"<why>\" (dave only).",
+                    1,
+                )
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
@@ -1000,18 +1042,25 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    ack_reason = getattr(args, "ack_no_gate", None)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if all(value is None for value in (title, body, priority, result, ack_reason)):
+        return _err("kanban edit: provide --title, --body, --priority, --result, or --ack-no-gate", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
     with kbc.connect_closing() as conn:
-        ok = kb.edit_task(
-            conn, args.task_id, title=title, body=body, priority=priority,
-            result=result, summary=summary, metadata=metadata,
-        )
+        ok = True
+        if any(value is not None for value in (title, body, priority, result)):
+            ok = kb.edit_task(
+                conn, args.task_id, title=title, body=body, priority=priority,
+                result=result, summary=summary, metadata=metadata,
+            )
+        elif ack_reason:
+            ok = kb.get_task(conn, args.task_id) is not None
+        if ok and ack_reason:
+            kb.record_gate_ack_none(conn, args.task_id, reason=ack_reason)
     return _ok_or_err(
         ok,
         f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",
@@ -1392,6 +1441,29 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+def _cmd_gate_audit(args: argparse.Namespace) -> int:
+    """Read-only scan (F-A2 Task 4): see `kanban gate-audit --help`."""
+    since = None
+    raw_since = getattr(args, "since", None)
+    if raw_since is not None:
+        try:
+            since = int(raw_since)
+        except ValueError:
+            return _err(f"kanban gate-audit: --since must be a unix timestamp, got {raw_since!r}", 2)
+    with kbc.connect_closing() as conn:
+        violations = kb.run_gate_audit(conn, ids=getattr(args, "ids", None), since=since)
+    if getattr(args, "json", False):
+        _print_json({"violations": violations, "count": len(violations)})
+    else:
+        if not violations:
+            print("gate-audit: clean (0 violations)")
+        else:
+            print(f"gate-audit: {len(violations)} violation(s)")
+            for v in violations:
+                print(f"  {v['task_id']}  {v['status']:10s}  {v['assignee'] or '(unassigned)':20s}  {v['title']}")
+    return 1 if violations else 0
+
+
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
@@ -1411,7 +1483,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc,
+    "gc": _cmd_gc, "gate-audit": _cmd_gate_audit,
 }
 
 

@@ -368,3 +368,142 @@ def test_cli_complete_without_override_names_the_unmet_gate(kanban_home):
         assert kb.get_task(conn, t).status != "done"
 
 
+# ---------------------------------------------------------------------------
+# F-A2 (gate marker-tagging discipline) — bulk pre-flight, creation-time
+# soft warn, and `gate-audit` CLI surface
+# ---------------------------------------------------------------------------
+
+
+def test_cli_bulk_complete_aborts_whole_batch_on_unmarked_keyword_match(kanban_home):
+    """Task 5 AC: batch of 3 ids, 1 flagged, 0 of the 3 complete."""
+    with kbc.connect_closing() as conn:
+        clean1 = kb.create_task(conn, title="Fix a typo", body="docs only")
+        flagged = kb.create_task(conn, title="Add OAuth login", body="new auth flow, no gate yet")
+        clean2 = kb.create_task(conn, title="Rename a variable", body="pure refactor")
+
+    out = kc.run_slash(f'complete {clean1} {flagged} {clean2} --result "bulk clear"')
+    assert "aborted" in out.lower()
+    assert flagged in out
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, clean1).status != "done"
+        assert kb.get_task(conn, flagged).status != "done"
+        assert kb.get_task(conn, clean2).status != "done"
+
+
+def test_cli_bulk_complete_hard_ack_requires_dave_identity(kanban_home, monkeypatch):
+    """The bulk pre-flight ack reuses the SAME dave-only --override-gate/
+    --override-reason primitive as the existing gate-holder override --
+    NOT a free `--i-reviewed` style flag. Non-dave identity still aborts."""
+    from hermes_cli import profiles as profiles_mod
+
+    with kbc.connect_closing() as conn:
+        clean = kb.create_task(conn, title="Fix a typo", body="docs only")
+        flagged = kb.create_task(conn, title="Add OAuth login", body="new auth flow")
+
+    monkeypatch.setattr(profiles_mod, "current_profile_name", lambda default=None: "alice")
+    out = kc.run_slash(
+        f'complete {clean} {flagged} --result "bulk clear" '
+        '--override-gate --override-reason "urgent"'
+    )
+    assert "aborted" in out.lower()
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, clean).status != "done"
+        assert kb.get_task(conn, flagged).status != "done"
+
+
+def test_cli_bulk_complete_hard_ack_as_dave_completes_whole_batch(kanban_home, monkeypatch):
+    from hermes_cli import profiles as profiles_mod
+
+    with kbc.connect_closing() as conn:
+        clean = kb.create_task(conn, title="Fix a typo", body="docs only")
+        flagged = kb.create_task(conn, title="Add OAuth login", body="new auth flow")
+
+    monkeypatch.setattr(profiles_mod, "current_profile_name", lambda default=None: "dave")
+    out = kc.run_slash(
+        f'complete {clean} {flagged} --result "bulk clear" '
+        '--override-gate --override-reason "reviewed out of band"'
+    )
+    assert "aborted" not in out.lower()
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, clean).status == "done"
+        assert kb.get_task(conn, flagged).status == "done"
+
+
+def test_cli_bulk_complete_proceeds_once_flagged_id_is_acked(kanban_home):
+    """A per-card `--ack-no-gate` exemption clears the preflight without
+    needing the dave-only override at all."""
+    with kbc.connect_closing() as conn:
+        clean = kb.create_task(conn, title="Fix a typo", body="docs only")
+        flagged = kb.create_task(conn, title="Add OAuth login", body="new auth flow")
+
+    ack_out = kc.run_slash(f'edit {flagged} --ack-no-gate "internal tool, reviewed informally"')
+    assert "Edited" in ack_out, ack_out
+
+    out = kc.run_slash(f'complete {clean} {flagged} --result "bulk clear"')
+    assert "aborted" not in out.lower()
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, clean).status == "done"
+        assert kb.get_task(conn, flagged).status == "done"
+
+
+def test_cli_single_complete_is_not_subject_to_bulk_preflight(kanban_home):
+    """Task 6 rationale: the hard check is bulk-only. A single deliberate
+    `complete <id>` on an unmarked keyword-matching card is unaffected --
+    zero regression on the common one-at-a-time completion path."""
+    with kbc.connect_closing() as conn:
+        flagged = kb.create_task(conn, title="Add OAuth login", body="new auth flow")
+
+    out = kc.run_slash(f'complete {flagged} --result "shipped"')
+    assert "aborted" not in out.lower()
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, flagged).status == "done"
+
+
+def test_cli_create_warns_when_keyword_match_and_no_marker_or_ack(kanban_home):
+    """Task 6 (Gate 1 resolution): SOFT warn only -- creation itself must
+    still succeed (exit 0, task created) even with no marker/ack."""
+    out = kc.run_slash('create "Add OAuth login" --body "new auth flow, nothing gated yet"')
+    assert "Created" in out
+    assert "gate-required" in out.lower() or "gate marker" in out.lower()
+
+
+def test_cli_create_with_ack_no_gate_suppresses_warning_and_records_event(kanban_home):
+    out = kc.run_slash(
+        'create "Add OAuth login" --body "new auth flow" '
+        '--ack-no-gate "internal-only tool, no external exposure" --json'
+    )
+    payload = json.loads(out)
+    task_id = payload["id"]
+    with kbc.connect_closing() as conn:
+        events = [e for e in kb.list_events(conn, task_id) if e.kind == "gate_ack_none"]
+        assert len(events) == 1
+        assert events[0].payload["reason"] == "internal-only tool, no external exposure"
+
+
+def test_cli_create_plain_card_no_warning(kanban_home):
+    out = kc.run_slash('create "Fix a typo" --body "docs only, nothing sensitive"')
+    assert "Created" in out
+    assert "gate-required" not in out.lower()
+
+
+def test_cli_gate_audit_json_reports_violations_and_exit_code(kanban_home, capsys):
+    with kbc.connect_closing() as conn:
+        flagged = kb.create_task(conn, title="Add OAuth login", body="new auth flow")
+        kb.create_task(conn, title="Fix a typo", body="docs only")
+
+    rc = kc._cmd_gate_audit(argparse.Namespace(ids=None, since=None, json=True))
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["violations"][0]["task_id"] == flagged
+
+
+def test_cli_gate_audit_clean_board_exits_zero(kanban_home):
+    with kbc.connect_closing() as conn:
+        kb.create_task(conn, title="Fix a typo", body="docs only")
+
+    rc = kc._cmd_gate_audit(argparse.Namespace(ids=None, since=None, json=True))
+    assert rc == 0
+
+
+

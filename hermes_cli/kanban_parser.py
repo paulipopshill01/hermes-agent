@@ -224,6 +224,12 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        _arg("--ack-no-gate", metavar="REASON",
+             help="Record that this card deliberately carries no gate marker, with REASON "
+                  "(F-A2 Task 6). SOFT only -- never blocks creation, even when the title/body "
+                  "looks gate-required and no marker is present; omitting it just prints a "
+                  "warning in that case. The HARD fail-closed check lives at bulk "
+                  "`kanban complete`, not here."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -322,8 +328,26 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
         _arg("--result", help="Backfilled task result text for a done task"),
+        _arg("--ack-no-gate", metavar="REASON",
+             help="Record that this card deliberately carries no gate marker, with REASON "
+                  "(F-A2 Task 6). SOFT only -- advisory bookkeeping, never blocks the edit."),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
+    _cmd("gate-audit", [
+        _arg("--ids", nargs="+", help="Scope the scan to exactly these task ids (bulk pre-flight use)"),
+        _arg("--since", metavar="TS",
+             help="Only report drift on tasks created or touched at/after this unix timestamp"),
+        _json_flag(help="Emit JSON output"),
+    ], help="Read-only scan for gate-worthy cards with no marker/sibling card/ack (F-A2 Task 4)",
+       description=(
+           "Flags any task where the Task 2 security-keyword heuristic matches the title/body "
+           "AND no parent-side 'Gated on ...' body marker is present AND no sibling gate-review "
+           "card exists under the same parent AND no `--ack-no-gate` exemption is recorded. "
+           "Exit code 0 = clean, 1 = violations found (so cron/CI can key off it). This never "
+           "mutates anything -- it is the read side of the F-A2 discipline; the write side is "
+           "the bulk `kanban complete` pre-flight, which runs this same check before touching "
+           "any task."
+       )),
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
