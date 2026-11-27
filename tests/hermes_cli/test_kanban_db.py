@@ -2423,7 +2423,10 @@ def test_claim_task_with_no_gate_marker_is_unaffected(kanban_home):
 
 # --- F-A2 (gate marker-tagging discipline, follow-up to CWE-862/F-A) ---
 # Plan 2026-11-27-gate-marker-tagging-discipline.md, Gate 1 cleared by Stella
-# (SHA cce053a3808cbd6a01f164d94a6c95ee348bd442ce3434a5c4e248eaffdc682c).
+# (draft SHA cce053a3808cbd6a01f164d94a6c95ee348bd442ce3434a5c4e248eaffdc682c;
+# current live SHA a41d288dc250f6798ca76b471a9d946277778fca615f2fbea5b3f426bab22c06,
+# amendments A1-A3 folded in post-Gate-1). Keyword taxonomy re-review:
+# /root/security-reviews/gate-marker-tagging-discipline-t_c2e4af61-20261127.md
 
 # Task 3: _looks_gate_required is a PURE keyword classifier -- true positive,
 # true negative, and the critical negative (sibling gate card present but no
@@ -2457,6 +2460,72 @@ def test_looks_gate_required_is_pure_no_db_access_needed():
     stays DB-free per Amendment A1, independent of any fixture."""
     assert kb._looks_gate_required("Add auth check", "plain body") is True
     assert kb._looks_gate_required("plain title", "plain body") is False
+
+
+# --- F-1/F-2 fix regression (t_73b8e4e1, Viktor closure t_c2e4af61, run 1903) ---
+# F-2: author-family / tokenizer / PCIe / dependency-injection false positives
+# that the pre-fix bare-stem regex (auth\w*, token\w*, pci\w*, injection) hit.
+# AC-1 in the review report.
+
+@pytest.mark.parametrize("title,body", [
+    ("comment author field", ""),
+    ("Fix author attribution in compaction summaries", ""),
+    ("Co-author field on comments", ""),
+    ("authoritative source list", ""),
+    ("Document the tokenizer budget", ""),
+    ("PCIe passthrough notes", ""),
+    ("Dependency injection cleanup", ""),
+    ("", "authored by someone"),
+    ("", "This is the authoritative source."),
+    ("", "Authority on the matter"),
+    ("", "Great authorship on this doc"),
+])
+def test_looks_gate_required_false_positive_regression_f2(title, body):
+    assert kb._looks_gate_required(title, body) is False
+
+
+# F-1: previously-missed categories + form variants (AC-2/AC-3 in the report).
+
+@pytest.mark.parametrize("title,body", [
+    ("TLS cert rotation", "Rotating the TLS certificate before expiry."),
+    ("RBAC follow-up", "Add a permission check to the admin route."),
+    ("Dependency CVE bump", "Bumps a package past a published CVE."),
+    ("Fix path traversal", "User-controlled path allows directory traversal."),
+    ("Secure cookie flags", "Set the Secure/HttpOnly cookie attributes."),
+    ("Dockerfile hardening", "Pin the base image digest in the Dockerfile."),
+    ("Pin base image digest", "Record the image digest for reproducibility."),
+    ("Rotate api_key", "api_key rotation for the external integration."),
+    ("Add input-validation", "input_validation on the new endpoint."),
+    ("Fix pickle deserialization bug", "Untrusted pickle deserializ... input."),
+    ("At-rest encryption", "Encrypt the data at rest."),
+    ("XXE vulnerability", "XML external entity injection fix."),
+    ("Audit logging for permission changes", "Log privilege escalation events."),
+    ("SSRF in webhook handler", "Server-side request forgery via webhook."),
+    ("Supply chain pin bump", "Pin a transitive dependency's supply-chain risk."),
+])
+def test_looks_gate_required_true_positive_new_categories_f1(title, body):
+    assert kb._looks_gate_required(title, body) is True
+
+
+@pytest.mark.parametrize("title", [
+    "api_key", "api-key", "input-validation", "input_validation",
+    "InputValidation", "external-api", "schema-change", "docker-image",
+    "dockerfile", "base image",
+])
+def test_looks_gate_required_form_variants_f1(title):
+    assert kb._looks_gate_required(title, None) is True
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("sanitise the log", True),
+    ("authorisation required", True),
+    ("authorised users only", True),
+    ("auth flow", True),
+    ("Add OAuth login", True),
+    ("Fix a typo", False),
+])
+def test_looks_gate_required_british_and_control_probes(title, expected):
+    assert kb._looks_gate_required(title, None) is expected
 
 
 # Task 4: gate_audit_violation / run_gate_audit assemble the real predicate,

@@ -3237,27 +3237,70 @@ def _gate_marker_matches_parents(conn: sqlite3.Connection, task_id: str) -> Opti
 # every other event kind in this file.
 
 # Viktor-curated security-keyword taxonomy (Task 2, plan
-# 2026-11-27-gate-marker-tagging-discipline.md, Gate 1 SHA
-# cce053a3808cbd6a01f164d94a6c95ee348bd442ce3434a5c4e248eaffdc682c).
-# DRAFT pending Viktor's explicit sign-off on the Security closure card
-# this build spawns -- IS the enforcement surface (too narrow = silent
-# slips, too broad = reflexive --ack-no-gate normalizes the blind spot
-# instead of closing it). Do not edit without going back through that
-# review.
-_GATE_REQUIRED_KEYWORDS: tuple[str, ...] = (
-    "auth", "authentication", "authorization", "authn", "authz",
-    "input validation", "sanitiz", "injection", "xss", "csrf",
-    "pii", "personal data", "personally identifiable",
-    "external api", "third-party api", "third party api", "webhook",
-    "file upload", "upload",
-    "secret", "credential", "api key", "apikey", "token", "password",
-    "private key", "encryption key",
-    "docker image", "docker tag", "container image",
-    "migration", "schema change", "schema migration",
-    "payment", "billing", "card number", "pci", "credit card",
+# 2026-11-27-gate-marker-tagging-discipline.md; drafted against Gate 1 SHA
+# cce053a3808cbd6a01f164d94a6c95ee348bd442ce3434a5c4e248eaffdc682c, current
+# live plan SHA a41d288dc250f6798ca76b471a9d946277778fca615f2fbea5b3f426bab22c06).
+# This list was Viktor-rejected once already (closure review t_c2e4af61, run
+# 1903) for F-1 (too narrow -- whole categories + multi-word form variants
+# missed) and F-2 (too broad -- bare `auth`/`token`/`pci`/`injection`/`upload`
+# stems overmatched author/tokenizer/PCIe/dependency-injection/artifact-upload
+# text). Full evidence + fix spec + 6 ACs:
+# /root/security-reviews/gate-marker-tagging-discipline-t_c2e4af61-20261127.md
+# (fixed per that spec on t_73b8e4e1; re-attested by Viktor on t_897dc096).
+# IS the enforcement surface (too narrow = silent slips, too broad =
+# reflexive --ack-no-gate normalizes the blind spot instead of closing it).
+# Do not edit without going back through that review.
+#
+# Each entry below is its OWN regex fragment (not a bare stem glued to a
+# shared `\w*` suffix) so every alternative can be bounded exactly where it
+# needs to be: `\b...\b` stems that must not bleed into a longer word
+# (auth/authn/authz/pci/tls/ssl/token(s)), `\w*`-suffixed stems that should
+# absorb inflections (secret/credential/encrypt/...), and multi-word terms
+# use the `[-_ ]?` separator class so "api key" / "api-key" / "api_key" /
+# "ApiKey" (camelCase folds under IGNORECASE with a zero-width separator)
+# all match the same alternative. `oauth` is split out explicitly because
+# `\bauth\b` deliberately does NOT match the "auth" substring inside "OAuth"
+# (no word boundary between the "O" and the "A") -- without this alternative
+# "Add OAuth login" would regress to a miss.
+# `upload` is intentionally NOT present bare (F-2): it only fired on
+# ordinary artifact-upload chores with no security content. Only the
+# `file[-_ ]upload` compound survives.
+_GATE_REQUIRED_KEYWORD_PATTERNS: tuple[str, ...] = (
+    # --- auth family: bounded. Must NOT match author/authored/authoring/
+    # authors/authoritative/authority/authorship. Must keep matching
+    # authorisation/authorised/authenticated/authorization/"auth flow"/
+    # "Add OAuth login".
+    r"\bauth\b", r"\bauthn\b", r"\bauthz\b", r"\boauth\w*",
+    r"\bauthenticat\w*", r"\bauthoriz\w*", r"\bauthoris\w*",
+    r"\binput[-_ ]?validation\w*",
+    r"\bsanitiz\w*", r"\bsanitis\w*",
+    # exclude "dependency injection" (keep SQL/command/prompt/code injection)
+    r"(?<!dependency )(?<!dependency-)(?<!dependency_)\binjection\w*",
+    r"\bxss\b", r"\bcsrf\b",
+    r"\bpii\b", r"\bpersonal[-_ ]?data\b", r"\bpersonally[-_ ]?identifiable\w*",
+    r"\bexternal[-_ ]?api\w*", r"\bthird[-_ ]?party[-_ ]?api\w*", r"\bwebhook\w*",
+    r"\bfile[-_ ]?upload\w*",
+    r"\bsecret\w*", r"\bcredential\w*", r"\bapi[-_ ]?key\w*", r"\bapikey\w*",
+    r"\btokens?\b", r"\bpassword\w*",
+    r"\bprivate[-_ ]?key\w*", r"\bencryption[-_ ]?key\w*", r"\bencrypt\w*",
+    r"\bdocker[-_ ]?(?:image|tag|compose)\w*", r"\bcontainer[-_ ]?image\w*",
+    r"\bmigration\w*", r"\bschema[-_ ]?(?:change|migration)\w*",
+    r"\bpayment\w*", r"\bbilling\w*", r"\bcard[-_ ]?number\w*",
+    r"\bpci\b", r"\bcredit[-_ ]?card\w*",
+    # --- categories added for F-1 coverage (every added stem is FP surface
+    # -- keep them bounded, re-measure, don't just guess) ---
+    r"\bcertificate\w*", r"\btls\b", r"\bssl\b", r"\bcookie\w*", r"\bsession\w*",
+    r"\brbac\w*", r"\bpermission\w*", r"\bprivilege\w*", r"\baccess[-_ ]?control\w*",
+    r"\btraversal\w*", r"\bssrf\w*", r"\bxxe\w*", r"\bdeserializ\w*", r"\bpickle\w*",
+    r"\bcve\w*", r"\bsupply[-_ ]?chain\w*", r"\bdockerfile\w*",
+    r"\bbase[-_ ]?image\w*", r"\bimage[-_ ]?digest\w*",
 )
+# Kept for any external/introspective callers that expect the historical
+# flat-keyword name; no longer used to build the regex (each pattern above
+# is independently bounded instead of sharing one `\w*` suffix).
+_GATE_REQUIRED_KEYWORDS: tuple[str, ...] = _GATE_REQUIRED_KEYWORD_PATTERNS
 _GATE_REQUIRED_KEYWORD_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(k) for k in _GATE_REQUIRED_KEYWORDS) + r")\w*",
+    "|".join(_GATE_REQUIRED_KEYWORD_PATTERNS),
     re.IGNORECASE,
 )
 

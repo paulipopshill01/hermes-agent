@@ -960,10 +960,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     if rc:
         return rc
     # --- F-A2 Task 5: HARD fail-closed bulk pre-flight ---
-    # Only a real bulk close (2+ ids) trips this -- a single deliberate
+    # Only a real bulk close (2+ ids) trips this -- NOT because a single
     # `complete <id>` is already covered by the existing (unchanged)
-    # per-card `_gate_unmet_approval` marker enforcement below; the risk
-    # this closes is silent BOARD-CLEARANCE sweeps, not one operator
+    # per-card `_gate_unmet_approval` marker enforcement below (it
+    # deliberately does NOT flag an unmarked gate-required card -- "no
+    # marker at all -> no raise" is its own documented behaviour). A
+    # single-id complete that slips through gate-required with no marker
+    # is covered post-hoc only, by the Task 7 drift cron
+    # (gate_audit_daily.sh). This pre-flight exists for the risk it
+    # actually closes: silent BOARD-CLEARANCE sweeps, not one operator
     # closing one card they're looking at (Task 6 rationale, Gate 1).
     # Fail-closed, whole-batch abort, BEFORE any `complete_task` call --
     # each id commits independently inside `_bulk_apply`, so this must be
