@@ -37,6 +37,7 @@ from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.context_compressor_sampling import SummaryInputSamplingMixin
 from agent.context_compressor_prompt_rules import EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt
 from agent.context_compressor_retry import retryable_user_text, typed_prompt_content
+from agent.message_metadata import ROLE_ORIGIN_KEY, is_compaction_synthetic, stamp_compaction_origin
 from agent.context_compressor_typed_input import TYPED_TURNS_POINTER, typed_summary_messages
 from agent.conversation_compression_scaffolding import is_user_role_scaffolding
 from agent.context_compressor_tail import (
@@ -5181,6 +5182,9 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
         # Frontends use this to detect a summary-prefixed message.
         msg[COMPRESSED_SUMMARY_METADATA_KEY], msg[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = True, bool(self._summary_has_user_turn)
+        # Structural provenance: this row's content is synthesized compaction summary text wearing
+        # summary_role, not a message a human/model actually produced (arXiv 2611.32194, Viktor Finding 2).
+        stamp_compaction_origin(msg)
         # Rewritten content: drop the stale api_content sidecar so replay can't resend pre-merge bytes.
         drop_stale_api_content(msg)
 
@@ -5378,6 +5382,9 @@ Write only the summary body. Do not include any preamble or prefix."""
                 COMPRESSED_SUMMARY_METADATA_KEY: True,
                 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(self._summary_has_user_turn),
             })
+            # Standalone (non-merged) path: same structural provenance stamp as the merge-into-tail
+            # branch (_merge_summary_into_tail_row) — both construction sites must tag their output.
+            stamp_compaction_origin(compressed[-1])
         # Default carrier is tail[0]: an exempt row absorbs the summary invisibly. The forced repair
         # path needs a non-empty role=user row, so it targets the template-visible row.
         merge_target_idx = first_tail_visible_idx if force_user_leading and first_tail_visible_idx is not None else 0
@@ -5455,6 +5462,11 @@ def split_user_originated_turn(message: Any) -> tuple[Optional[dict[str, Any]], 
             handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = bool(message.get(COMPRESSED_SUMMARY_HAS_USER_TURN_KEY))
         if message.get(MICRO_COMPACT_MARKER_KEY):
             handoff[MICRO_COMPACT_MARKER_KEY] = True
+        if is_compaction_synthetic(message):
+            # Nested/re-wrapped compaction (Task 3b): this fresh handoff dict only copies an explicit
+            # field whitelist, so the structural provenance tag must be re-stamped here too or a later
+            # compaction pass re-wrapping this handoff would silently drop it.
+            stamp_compaction_origin(handoff)
         if message.get("timestamp") is not None:
             handoff["timestamp"] = message["timestamp"]
         drop_stale_api_content(handoff)
@@ -5472,6 +5484,7 @@ def split_user_originated_turn(message: Any) -> tuple[Optional[dict[str, Any]], 
     for key in (
         COMPRESSED_SUMMARY_METADATA_KEY, COMPRESSED_SUMMARY_HAS_USER_TURN_KEY, MICRO_COMPACT_MARKER_KEY,
         _DB_PERSISTED_MARKER, *(("_row_id",) if is_summary else ()), "display_kind", "display_metadata",
+        ROLE_ORIGIN_KEY,
     ):
         candidate.pop(key, None)
     carrier_metadata = message.get("display_metadata")

@@ -156,6 +156,44 @@ def lift_data_use(message: MutableMapping[str, Any]) -> None:
         message[DATA_USE] = list(metadata[DATA_USE])
 
 
+# Structural provenance tag for compaction-generated summary content: distinguishes "synthesized summary
+# text wearing a role tag" from "a message a human/model actually produced" for any trust-sensitive
+# consumer (approval gate, allowlist, tool-output fence-strip) that would otherwise infer authorization
+# from role=="user" alone (arXiv 2611.32194; Viktor memory-triage Finding 2). Rides in display_metadata
+# (persisted by SessionDB, popped from every wire copy) exactly like INFLIGHT_TASK_RESTATEMENT, so it
+# survives the real persistence path without a new DB column — and is ALSO kept at top level for
+# in-memory consumers that never round-tripped through the store this turn.
+ROLE_ORIGIN_KEY = "_role_origin"
+COMPACTION_SUMMARY_ORIGIN = "compaction_summary"
+
+
+def stamp_compaction_origin(msg: MutableMapping[str, Any]) -> None:
+    """Tag *msg* as compaction-synthesized summary content, at construction time.
+
+    Stamps both the top-level key (read by in-memory consumers this same turn) and its durable
+    ``display_metadata`` copy (read back after a state.db round trip or session replay).
+    """
+    msg[ROLE_ORIGIN_KEY] = COMPACTION_SUMMARY_ORIGIN
+    _set_display_metadata_key(msg, ROLE_ORIGIN_KEY, COMPACTION_SUMMARY_ORIGIN)
+
+
+def is_compaction_synthetic(msg: Any) -> bool:
+    """True when *msg* is compaction-synthesized summary content.
+
+    The ONLY sanctioned way to check (kanban-gate-review rule 31: one shared helper, no consumer
+    re-implements role/delimiter sniffing). Checks the top-level tag first, then its durable
+    ``display_metadata`` copy — a message freshly loaded from state.db or replayed across a session
+    boundary may carry only the latter. A True result means this content must never satisfy an
+    approval, allowlist, or authorization check, regardless of its role tag or apparent phrasing.
+    """
+    if not isinstance(msg, Mapping):
+        return False
+    if msg.get(ROLE_ORIGIN_KEY) == COMPACTION_SUMMARY_ORIGIN:
+        return True
+    metadata = msg.get("display_metadata")
+    return isinstance(metadata, Mapping) and metadata.get(ROLE_ORIGIN_KEY) == COMPACTION_SUMMARY_ORIGIN
+
+
 # Reasoning tokens the provider billed for an assistant turn (``usage.*_tokens_details.reasoning_tokens``),
 # kept inside ``display_metadata`` so it rides every writer, branch and compaction copy without a column.
 # Encrypted reasoning (Codex/xAI ``encrypted_content``, Claude ``signature``) cannot be sized from its
@@ -264,8 +302,14 @@ def scaffolding_replay_fields(msg: Mapping[str, Any]) -> dict:
     prune re-persists the replayed view, so a dropped flag would get the row stamped on the next replay."""
     metadata = msg.get("display_metadata")
     fields: dict = {"_compressed_summary": True} if msg.get("_compressed_summary") else {}
+    meta_fields: dict = {}
     if isinstance(metadata, dict) and metadata.get(INFLIGHT_TASK_RESTATEMENT):
-        fields["display_metadata"] = {INFLIGHT_TASK_RESTATEMENT: True}
+        meta_fields[INFLIGHT_TASK_RESTATEMENT] = True
+    if is_compaction_synthetic(msg):
+        fields[ROLE_ORIGIN_KEY] = COMPACTION_SUMMARY_ORIGIN
+        meta_fields[ROLE_ORIGIN_KEY] = COMPACTION_SUMMARY_ORIGIN
+    if meta_fields:
+        fields["display_metadata"] = meta_fields
     return fields
 
 
