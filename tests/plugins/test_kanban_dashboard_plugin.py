@@ -638,6 +638,69 @@ def test_bulk_status_ready(client):
     ids = {task["id"] for task in ready["tasks"]}
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
 
+def test_bulk_status_done_skips_live_claimed_task(client, monkeypatch):
+    """F-A3 (t_0bb1dafe Task 3): a bulk ``done`` sweep must NOT force-close a task
+    that's ``running`` under a live worker claim. The live-claimed id should come
+    back in the response with ``ok=False`` (LiveClaimError message) while sibling
+    ids in the same batch still complete — this is the bug that let run #1891
+    0s-sweep t_948e292c/t_38047a18 underneath their live claims."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    live = client.post("/api/plugins/kanban/tasks", json={"title": "live worker"}).json()["task"]
+    normal = client.post("/api/plugins/kanban/tasks", json={"title": "normal"}).json()["task"]
+
+    with kbc.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, live["id"], claimer=f"{host}:worker")
+        kbd._set_worker_pid(conn, live["id"], 999999)
+    # _worker_alive() resolves `_kb._pid_alive` (module-qualified, looked up at call
+    # time) where `_kb` is this `kanban_db` module — so the patch target is `kb`, not
+    # `kanban_db_dispatch`, even though `_set_worker_pid`/`_worker_alive` live there.
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [live["id"], normal["id"]], "status": "done", "summary": "swept"},
+    )
+    assert response.status_code == 200, response.text
+    results = {item["id"]: item for item in response.json()["results"]}
+
+    # The live-claimed row is refused, not silently force-closed.
+    assert results[live["id"]]["ok"] is False
+    assert "live worker claim" in results[live["id"]]["error"]
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, live["id"])
+        assert task is not None and task.status == "running"
+
+    # The sibling with no live claim still completes in the same batch.
+    assert results[normal["id"]]["ok"] is True
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, normal["id"])
+        assert task is not None and task.status == "done"
+
+
+def test_single_card_done_still_force_closes_live_claim(client, monkeypatch):
+    """AC2 regression guard: the single-card PATCH path (a human dashboard action)
+    must keep its pre-existing force=True behavior — only the bulk path changes."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    live = client.post("/api/plugins/kanban/tasks", json={"title": "live worker 2"}).json()["task"]
+    with kbc.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, live["id"], claimer=f"{host}:worker")
+        kbd._set_worker_pid(conn, live["id"], 999998)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{live['id']}",
+        json={"status": "done", "summary": "human override via dashboard"},
+    )
+    assert response.status_code == 200, response.text
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, live["id"])
+        assert task is not None and task.status == "done"
+
+
 def test_bulk_review_assignment_preserves_implementer_provenance(client):
     tasks = [
         client.post(
