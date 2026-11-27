@@ -280,7 +280,10 @@ _SPECS = [
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the current board"),
     _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
-    _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
+    _cmd("unlink", [
+        _arg("parent_id"), _arg("child_id"),
+        _arg("--reason", required=True, help="Why this dependency edge is being removed (mandatory, F-2)"),
+    ], help="Remove a parent->child dependency"),
     _cmd("claim", [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),

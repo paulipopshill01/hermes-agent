@@ -838,9 +838,12 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
 
 
 @router.delete("/links")
-def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: Optional[str] = Query(None)):
-    with _board_conn(board) as (board, conn):
-        return {"ok": bool(kanban_db.unlink_tasks(conn, parent_id, child_id))}
+def delete_link(
+    parent_id: str = Query(...), child_id: str = Query(...), board: Optional[str] = Query(None),
+    reason: str = Query(..., min_length=1),
+):
+    with _board_conn(board) as (board, conn), _value_error_400():
+        return {"ok": bool(kanban_db.unlink_tasks(conn, parent_id, child_id, reason=reason))}
 
 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:

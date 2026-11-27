@@ -1441,7 +1441,7 @@ def test_link_tasks_archived_parent_is_terminal_no_gate(kanban_home):
         assert "dependency_wait" not in [e.kind for e in kb.list_events(conn, child)]
 
 
-def test_unlink_tasks_triggers_recompute_ready(kanban_home):
+def test_unlink_tasks_triggers_recompute_ready(kanban_home, monkeypatch):
     """Regression test for issue #22459.
 
     Removing a dependency via unlink_tasks must immediately promote the child
@@ -1450,7 +1450,12 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
 
     Before the fix, child stayed 'todo' indefinitely after unlink; only the
     next dispatcher tick or a manual 'hermes kanban recompute' would promote it.
+
+    F-2 hardening means unlinking an edge a not-done child depends on now
+    requires the resolved 'dave' identity — this is exactly that case (the
+    child ``b`` is still 'todo' when the edge is removed).
     """
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "dave")
     with kbc.connect() as conn:
         # A is done.
         a = kb.create_task(conn, title="parent-done")
@@ -1465,7 +1470,7 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
         assert kb.get_task(conn, b).status == "todo"
 
         # Remove the blocking dependency C → B.
-        removed = kb.unlink_tasks(conn, c, b)
+        removed = kb.unlink_tasks(conn, c, b, reason="regression test #22459")
         assert removed is True
 
         # B's only remaining parent is A (done) → must be ready immediately.
@@ -2419,3 +2424,267 @@ def test_claim_task_with_no_gate_marker_is_unaffected(kanban_home):
         claimed = kb.claim_task(conn, t)
         assert claimed is not None
         assert claimed.status == "running"
+
+
+# ---------------------------------------------------------------------------
+# F-1/F-2/F-3 (2026-11-27 bulk-sweep review t_03f1ac5f) — gate-prose linter,
+# Gate 1 sibling prefixes, unlink hardening, completion actor attribution
+# ---------------------------------------------------------------------------
+
+
+def test_gate_child_title_prefixes_cover_gate_1_forms(kanban_home):
+    """F-1.2: a Gate-1-titled sibling now gates its sibling, same as Gate 2
+    siblings already did — the bulk-sweep review found zero Gate 1 forms
+    matched before this fix."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="feature epic")
+        t = kb.create_task(conn, title="gated build card", parents=[parent])
+        gate_child = kb.create_task(
+            conn, title="Stella Gate 1: feature epic", assignee="stella", parents=[parent],
+        )
+        assert kb.complete_task(conn, parent, result="epic scaffolded")
+        with pytest.raises(kb.GateUnmetError):
+            kb.complete_task(conn, t, result="done anyway")
+        kb.add_comment(conn, gate_child, "stella", "APPROVED.")
+        assert kb.complete_task(conn, gate_child, result="cleared")
+        assert kb._gate_unmet_approval(conn, t) is None
+
+
+def test_gate_child_title_prefixes_cover_gate_1_for_form(kanban_home):
+    """F-1.2: the other Gate 1 sibling form, 'gate 1 for'."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="feature epic 2")
+        t = kb.create_task(conn, title="gated build card 2", parents=[parent])
+        gate_child = kb.create_task(
+            conn, title="Gate 1 for feature epic 2", assignee="stella", parents=[parent],
+        )
+        assert kb.complete_task(conn, parent, result="epic scaffolded")
+        child_marker = kb._find_child_gate_marker(conn, t)
+        assert child_marker == (gate_child, "stella", "1")
+
+
+def test_gate_prose_registration_gap_detects_unbacked_prose(kanban_home):
+    """F-1.1 probe: 'Forge: hold for that pass' with no formal marker and no
+    sibling gate card is a registration gap."""
+    with kbc.connect() as conn:
+        t = kb.create_task(
+            conn, title="probe card",
+            body="Forge: hold for that pass before shipping.",
+        )
+        gap = kb._gate_prose_registration_gap(conn, t)
+        assert gap is not None
+        assert gap["matched"].lower() == "hold for"
+
+
+@pytest.mark.parametrize("phrase", [
+    "once Gate 2 clears we can ship",
+    "Gate 1 pass required first",
+    "Precondition: viktor authorizes this merge",
+    "do not refactor before touching the auth module",
+])
+def test_gate_prose_registration_gap_detects_each_controlled_phrase(kanban_home, phrase):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="probe card", body=phrase)
+        assert kb._gate_prose_registration_gap(conn, t) is not None
+
+
+def test_gate_prose_registration_gap_none_when_formal_marker_present(kanban_home):
+    """A card using prose AND the formal marker is registered, not a gap —
+    the marker makes the prose-only language moot."""
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        gate_card = kb.create_task(conn, title="Stella Gate 1 review")
+        t = kb.create_task(
+            conn, title="gated build card",
+            body=f"hold for that pass. Gated on Stella Gate 1 ({gate_card}).",
+        )
+        assert kb._gate_prose_registration_gap(conn, t) is None
+
+
+def test_gate_prose_registration_gap_none_when_sibling_present(kanban_home):
+    _mk_profile(kanban_home, "stella")
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="feature epic 3")
+        t = kb.create_task(
+            conn, title="gated build card 3", parents=[parent],
+            body="hold for that pass before merging.",
+        )
+        kb.create_task(conn, title="Stella Gate 1: feature epic 3", assignee="stella", parents=[parent])
+        assert kb._gate_prose_registration_gap(conn, t) is None
+
+
+def test_gate_prose_registration_gap_none_without_controlled_phrase(kanban_home):
+    """Merely mentioning 'gate' in unrelated prose must not trip the
+    linter — same false-positive-avoidance discipline as _GATE_MARKER_RE."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="plain card", body="Opened the garden gate this morning.")
+        assert kb._gate_prose_registration_gap(conn, t) is None
+
+
+def test_claim_task_warn_first_records_advisory_event_and_still_claims(kanban_home):
+    """F-1 acceptance probe: a ready card carrying 'Forge: hold for that
+    pass' with no marker claims successfully (warn-first) and records a
+    gate_prose_unregistered advisory event."""
+    with kbc.connect() as conn:
+        t = kb.create_task(
+            conn, title="probe card",
+            body="Forge: hold for that pass before shipping.",
+        )
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.status == "running"
+        events = [e for e in kb.list_events(conn, t) if e.kind == "gate_prose_unregistered"]
+        assert len(events) == 1
+        assert events[0].payload["matched"].lower() == "hold for"
+        assert events[0].payload["fail_closed"] is False
+        assert events[0].payload["stage"] == "claim"
+
+
+def test_claim_task_fail_closed_rejects_unregistered_prose(kanban_home, monkeypatch):
+    """Flipping _GATE_PROSE_FAIL_CLOSED makes the same probe card fail
+    closed at claim time, mirroring the gate_marker_not_linked path."""
+    monkeypatch.setattr(kb, "_GATE_PROSE_FAIL_CLOSED", True)
+    with kbc.connect() as conn:
+        t = kb.create_task(
+            conn, title="probe card",
+            body="Forge: hold for that pass before shipping.",
+        )
+        claimed = kb.claim_task(conn, t)
+        assert claimed is None
+        assert kb.get_task(conn, t).status == "todo"
+        events = [e for e in kb.list_events(conn, t) if e.kind == "claim_rejected"]
+        assert events and events[-1].payload["reason"] == "gate_prose_unregistered"
+
+
+def test_complete_task_warn_first_records_advisory_event_and_still_completes(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(
+            conn, title="probe card",
+            body="Forge: hold for that pass before shipping.",
+        )
+        assert kb.complete_task(conn, t, result="done")
+        assert kb.get_task(conn, t).status == "done"
+        events = [e for e in kb.list_events(conn, t) if e.kind == "gate_prose_unregistered"]
+        assert len(events) == 1
+        assert events[0].payload["stage"] == "complete"
+
+
+def test_complete_task_fail_closed_rejects_unregistered_prose(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_GATE_PROSE_FAIL_CLOSED", True)
+    with kbc.connect() as conn:
+        t = kb.create_task(
+            conn, title="probe card",
+            body="Forge: hold for that pass before shipping.",
+        )
+        with pytest.raises(kb.GateUnmetError) as exc_info:
+            kb.complete_task(conn, t, result="done anyway")
+        assert exc_info.value.reason.startswith("parse_failure")
+        assert kb.get_task(conn, t).status != "done"
+
+
+# --- F-2 (CWE-670/862): unlink_tasks hardening ---
+
+
+def test_unlink_tasks_requires_non_empty_reason(kanban_home):
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="parent")
+        b = kb.create_task(conn, title="child", parents=[a])
+        with pytest.raises(ValueError):
+            kb.unlink_tasks(conn, a, b, reason="")
+        with pytest.raises(ValueError):
+            kb.unlink_tasks(conn, a, b, reason="   ")
+        # Neither refusal removed the edge.
+        assert kb.parent_ids(conn, b) == [a]
+
+
+def test_unlink_tasks_records_reason_and_identity_on_event(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "dave")
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="parent")
+        kb.complete_task(conn, a, result="done")
+        b = kb.create_task(conn, title="child", parents=[a])
+        assert kb.unlink_tasks(conn, a, b, reason="duplicate dependency, no longer needed")
+        events = [e for e in kb.list_events(conn, b) if e.kind == "unlinked"]
+        assert len(events) == 1
+        assert events[0].payload["reason"] == "duplicate dependency, no longer needed"
+        assert events[0].payload["identity"] == "dave"
+
+
+def test_unlink_tasks_blocks_non_dave_identity_on_live_child_dependency(kanban_home, monkeypatch):
+    """F-2: unlinking an edge a NOT-DONE child still depends on requires the
+    resolved 'dave' identity — this is the exact unlink-then-force-complete
+    gate-stripping shape the review flagged."""
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "alice")
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="parent-not-done")
+        b = kb.create_task(conn, title="child", parents=[a])
+        assert kb.get_task(conn, b).status == "todo"
+        with pytest.raises(kb.UnlinkNotAuthorizedError):
+            kb.unlink_tasks(conn, a, b, reason="trying to strip the gate")
+        # Edge must survive the refused attempt.
+        assert kb.parent_ids(conn, b) == [a]
+
+
+def test_unlink_tasks_allows_non_dave_identity_once_child_is_done(kanban_home, monkeypatch):
+    """The common cleanup case (child already done) needs no special
+    identity — there is no live dependency left to strip."""
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "alice")
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="parent")
+        b = kb.create_task(conn, title="child", parents=[a])
+        kb.complete_task(conn, a, result="done")
+        kb.complete_task(conn, b, result="done")
+        assert kb.unlink_tasks(conn, a, b, reason="cleanup after completion")
+
+
+def test_unlink_tasks_allows_dave_identity_regardless_of_child_status(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "dave")
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="parent")
+        b = kb.create_task(conn, title="child", parents=[a])
+        assert kb.get_task(conn, b).status == "todo"
+        assert kb.unlink_tasks(conn, a, b, reason="dave-authorized removal")
+
+
+# --- F-3 (CWE-778): completion actor attribution ---
+
+
+def test_completed_event_records_completed_by_resolved_identity(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "forge")
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="plain card", assignee="forge")
+        kb.claim_task(conn, t)
+        assert kb.complete_task(conn, t, result="done", expected_run_id=kb._current_run_id(conn, t))
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        assert completed.payload["completed_by"] == "forge"
+
+
+def test_completed_event_records_completed_by_distinct_from_assignee(kanban_home, monkeypatch):
+    """The whole point of F-3: a completion run by a DIFFERENT identity than
+    the card's assignee (e.g. a bulk-clearance sweep) must not be
+    attributed to the assignee."""
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "bulk-sweep-operator")
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="plain card", assignee="forge")
+        assert kb.complete_task(conn, t, result="done")
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        assert completed.payload["completed_by"] == "bulk-sweep-operator"
+        assert completed.payload.get("completed_by") != "forge"
+
+
+def test_synthesize_ended_run_metadata_carries_completed_by(kanban_home, monkeypatch):
+    """A never-claimed task's synthesized run metadata also carries
+    completed_by, not just the completed event."""
+    monkeypatch.setattr(kb, "_resolved_caller_identity", lambda: "dave")
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="never claimed", assignee="forge")
+        assert kb.complete_task(conn, t, result="done without ever claiming")
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (t,),
+        ).fetchone()
+        assert row is not None
+        import json as _json
+        meta = _json.loads(row["metadata"])
+        assert meta["completed_by"] == "dave"

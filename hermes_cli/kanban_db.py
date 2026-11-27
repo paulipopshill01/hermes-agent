@@ -1629,14 +1629,57 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+class UnlinkNotAuthorizedError(ValueError):
+    """``unlink_tasks`` refused: the edge removes a not-done child's only
+    (or a) dependency and the resolved caller identity is not ``dave``.
+
+    F-2 (CWE-670/862, 2026-11-27 bulk-sweep review t_03f1ac5f): unlink was a
+    bare, unauthenticated ``DELETE FROM task_links`` — no reason, no actor,
+    no check on whether the edge it removes is still load-bearing. Removing
+    a dependency a live (not-done) child is waiting on is the exact
+    "unlink-then-force-complete" gate-stripping shape the review flagged, so
+    that specific case is restricted to the same resolved ``dave`` identity
+    the gate override already uses — never a caller-supplied string.
+    """
+
+    def __init__(self, parent_id: str, child_id: str):
+        self.parent_id = parent_id
+        self.child_id = child_id
+        super().__init__(
+            f"unlink refused: {parent_id} -> {child_id} is a live dependency "
+            f"(child not done); only 'dave' may remove it"
+        )
+
+
+def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str, *, reason: str) -> bool:
+    """Remove the ``parent_id -> child_id`` dependency edge.
+
+    F-2 hardening (CWE-670/862): ``reason`` is mandatory (non-empty after
+    stripping) and is recorded on the ``unlinked`` event alongside the
+    resolved caller identity (:func:`_resolved_caller_identity` — never a
+    caller-supplied identity string, same mechanism as the gate override).
+    Removing an edge a NOT-DONE child still depends on requires the
+    resolved identity to be ``dave``; raises :class:`UnlinkNotAuthorizedError`
+    otherwise. A done child (the common cleanup-after-completion case) has
+    no live dependency left to strip, so any identity may unlink it.
+    """
+    reason_text = str(reason).strip() if reason else ""
+    if not reason_text:
+        raise ValueError("unlink_tasks requires a non-empty reason")
+    identity = _resolved_caller_identity()
+    child = get_task(conn, child_id)
+    if child is not None and child.status != "done" and identity != "dave":
+        raise UnlinkNotAuthorizedError(parent_id, child_id)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
         )
         removed = cur.rowcount > 0
         if removed:
-            _append_event(conn, child_id, "unlinked", {"parent": parent_id, "child": child_id})
+            _append_event(
+                conn, child_id, "unlinked",
+                {"parent": parent_id, "child": child_id, "reason": reason_text, "identity": identity},
+            )
     if removed:
         # Re-gate the child now (as complete_task/unblock_task do) instead of
         # leaving it in todo until the next tick.
@@ -2037,7 +2080,15 @@ def _synthesize_ended_run(
 
     ``profile`` overrides the profile read off the task row: transitions that
     reassign the task (e.g. review handoff) pass the acting profile captured
-    before the rewrite, so the run names the actor, not the new assignee."""
+    before the rewrite, so the run names the actor, not the new assignee.
+
+    F-3 (CWE-778, 2026-11-27 bulk-sweep review t_03f1ac5f): a ``completed``
+    outcome always carries ``completed_by`` (the resolved CALLING identity,
+    :func:`_resolved_caller_identity`) in its metadata — ``profile`` above
+    is the task's assignee/reassigned actor, not necessarily who actually
+    invoked the completion (e.g. a bulk-clearance sweep run under a
+    different identity than the card's own assignee).
+    """
     now = int(time.time())
     trow = conn.execute(
         "SELECT assignee, current_step_key FROM tasks WHERE id = ?", (task_id,),
@@ -2045,6 +2096,9 @@ def _synthesize_ended_run(
     if profile is _UNSET:
         profile = trow["assignee"] if trow else None
     step_key = trow["current_step_key"] if trow else None
+    if outcome == "completed":
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata.setdefault("completed_by", _resolved_caller_identity())
     cur = conn.execute(
         """
         INSERT INTO task_runs (
@@ -2296,6 +2350,26 @@ def claim_task(
                 {"reason": "gate_marker_not_linked", "ref": mismatched_ref},
             )
             return None
+        # F-1 (CWE-862/693, gate-registration gap): a prose-only gate
+        # declaration is invisible to _gate_unmet_approval. Warn-first while
+        # _GATE_PROSE_FAIL_CLOSED is False (advisory event, claim proceeds);
+        # once flipped, treat it exactly like the structural mismatch above.
+        prose_gap = _gate_prose_registration_gap(conn, task_id)
+        if prose_gap is not None:
+            _append_event(
+                conn, task_id, "gate_prose_unregistered",
+                {"matched": prose_gap["matched"], "fail_closed": _GATE_PROSE_FAIL_CLOSED, "stage": "claim"},
+            )
+            if _GATE_PROSE_FAIL_CLOSED:
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'", (task_id,),
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "gate_prose_unregistered", "matched": prose_gap["matched"]},
+                )
+                return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
@@ -2792,6 +2866,21 @@ def complete_task(
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    # F-1 (CWE-862/693, gate-registration gap): same prose-linter as
+    # claim_task, at the other transition a prose-only gate can slip past.
+    # Warn-first (advisory event only) while _GATE_PROSE_FAIL_CLOSED is False.
+    prose_gap = _gate_prose_registration_gap(conn, task_id)
+    if prose_gap is not None:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "gate_prose_unregistered",
+                {"matched": prose_gap["matched"], "fail_closed": _GATE_PROSE_FAIL_CLOSED, "stage": "complete"},
+            )
+        if _GATE_PROSE_FAIL_CLOSED:
+            raise GateUnmetError(
+                task_id,
+                "parse_failure: gate declared in prose; add the formal marker or remove the gate language",
+            )
     # Cheap pre-check; re-checked inside the txn to close the gate-holder race
     # (the gate card could be un-done again between here and the write txn).
     _check_gate_requirements(conn, task_id, override_gate=override_gate, override_reason=override_reason)
@@ -2966,6 +3055,7 @@ _GATE_MARKER_RE = re.compile(
 # ``assignee`` is the gate-holder, no separate config table.
 _GATE_CHILD_TITLE_PREFIXES: tuple[str, ...] = (
     "stella gate 2:", "gate 2 for", "security closure:",
+    "stella gate 1:", "gate 1 for",
 )
 
 # Recognized verdict tokens, case-insensitive, matched on real word boundaries (never a bare
@@ -3158,6 +3248,71 @@ def _gate_unmet_approval(conn: sqlite3.Connection, task_id: str) -> None:
     return  # not gated at all — the common case
 
 
+# --- Gate-prose registration linter (F-1, CWE-862/693 follow-up; 2026-11-27 ---
+# bulk-sweep review t_03f1ac5f) ---
+#
+# _gate_unmet_approval above can only ever enforce a gate it can SEE: the
+# formal "Gated on ..." body marker or a _GATE_CHILD_TITLE_PREFIXES sibling.
+# A card can declare the identical intent in free prose ("hold for that
+# pass", "once Gate 1 clears") and _gate_unmet_approval silently treats it
+# as ungated — the check runs, finds nothing to enforce, and the completion
+# goes through clean. At audit time 393 of 435 board gate declarations
+# (90.4%) were prose-only, invisible to the formal-marker regex by design
+# (the "Gated on" anchor is deliberate — see the comment above
+# _GATE_MARKER_RE — so this is a REGISTRATION linter layered on top, not a
+# weakening of that anchor).
+#
+# This is a registration check only: it never evaluates whether a
+# referenced gate is satisfied, only whether gate-shaped language in the
+# body is backed by something _gate_unmet_approval can actually see (a
+# formal marker or a sibling gate-review card). Ship warn-first — record an
+# advisory event, never block — for one sweep cycle so the existing
+# prose-only backlog can be migrated without a mass claim/completion
+# outage; flip _GATE_PROSE_FAIL_CLOSED to True once that sweep is done to
+# make an unregistered prose gate a hard claim/completion block, same
+# family as GateUnmetError.
+_GATE_PROSE_FAIL_CLOSED = False
+
+# Controlled gate-prose phrases (spec: hold for / once Gate N clears / Gate N
+# pass / Precondition: <profile> authorizes / before touching). Deliberately
+# narrow — this taxonomy is enforcement surface, not a general "mentions a
+# gate" detector; broadening it risks the same false-positive-block
+# regression _GATE_MARKER_RE's own design comment warns against.
+_GATE_PROSE_PATTERNS: tuple[str, ...] = (
+    r"\bhold for\b",
+    r"\bonce Gate \d+ clears\b",
+    r"\bGate \d+ pass(?:es)?\b",
+    r"\bPrecondition:\s*\w+\s+authorizes\b",
+    r"\bbefore touching\b",
+)
+_GATE_PROSE_RE = re.compile("|".join(_GATE_PROSE_PATTERNS), re.IGNORECASE)
+
+
+def _gate_prose_registration_gap(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """``None`` when ``task_id`` is clean; otherwise a violation dict
+    (``matched``: the literal phrase found) when the card's body uses
+    controlled gate-prose language WITHOUT a formal marker
+    (:func:`_find_parent_gate_marker`) or a matching
+    :data:`_GATE_CHILD_TITLE_PREFIXES` sibling (:func:`_find_child_gate_marker`).
+
+    Pure read — never raises, never writes an event. Callers decide
+    warn-vs-fail-closed and own the event/txn shape for their own call site
+    (claim-time is mid-txn already; complete-time is a pre-txn check,
+    mirroring how :func:`_gate_marker_matches_parents` is used).
+    """
+    task = get_task(conn, task_id)
+    if task is None or not task.body:
+        return None
+    m = _GATE_PROSE_RE.search(task.body)
+    if not m:
+        return None
+    if _find_parent_gate_marker(task.body) is not None:
+        return None  # formal marker present — registered, not a gap
+    if _find_child_gate_marker(conn, task_id) is not None:
+        return None  # sibling gate-review card present — registered, not a gap
+    return {"matched": m.group(0)}
+
+
 def _resolved_caller_identity() -> str:
     """Single calling-identity resolution for the gate override check and its
     audit log. Mirrors ``hermes_cli.kanban._profile_author()`` exactly (same
@@ -3254,7 +3409,14 @@ def _completed_event_payload(
     """``completed`` event payload: first summary line (400 chars) so gateway
     notifiers / dashboard WS render without a second round-trip; verified
     cards; and ``metadata["artifacts"]`` promoted so the notifier can upload
-    them as native attachments without fetching the run row."""
+    them as native attachments without fetching the run row.
+
+    F-3 (CWE-778, 2026-11-27 bulk-sweep review t_03f1ac5f): ``completed_by``
+    is the resolved CALLING identity (:func:`_resolved_caller_identity`),
+    never the task's ``assignee`` — a run's ``profile`` column reads as the
+    assigned worker even when a different identity (e.g. a bulk-clearance
+    sweep run as a different profile) actually invoked the completion.
+    """
     # Mirror CLI's _show_voice_status: include STT/TTS provider availability so the user can tell at a
     # glance *why* voice mode isn't working ("STT provider: MISSING ..." is the common case). ``record_key``
     # mirrors the configured ``voice.record_key`` so the TUI can both bind it (frontend
@@ -3263,6 +3425,7 @@ def _completed_event_payload(
     payload: dict = {
         "result_len": len(result) if result else 0,
         "summary": _first_line(event_summary, 400) or None,
+        "completed_by": _resolved_caller_identity(),
     }
     if verified_cards:
         payload["verified_cards"] = verified_cards

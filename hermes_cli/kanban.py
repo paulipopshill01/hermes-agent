@@ -734,7 +734,15 @@ def _cmd_link(args: argparse.Namespace) -> int:
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
-        ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
+        try:
+            ok = kb.unlink_tasks(conn, args.parent_id, args.child_id, reason=args.reason)
+        except kb.UnlinkNotAuthorizedError as exc:
+            return _err(
+                f"cannot unlink {args.parent_id} -> {args.child_id}: {exc} "
+                f"(re-run as the dave profile, or complete the child first)"
+            )
+        except ValueError as exc:
+            return _err(f"cannot unlink {args.parent_id} -> {args.child_id}: {exc}")
     return _ok_or_err(ok, f"No such link: {args.parent_id} -> {args.child_id}",
                       f"Unlinked {args.parent_id} -> {args.child_id}")
 
