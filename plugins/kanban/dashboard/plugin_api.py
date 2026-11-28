@@ -540,8 +540,24 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 # --- PATCH /tasks/:id  and  POST /tasks/bulk ---------------------------------
 
+# Closed set of status verbs the bulk/_STATUS_HANDLERS dispatch table ever recognizes
+# (handled by _STATUS_HANDLERS, or deliberately rejected like "running" — see
+# _RUNNING_DIRECT_MSG). Constraining the field to this Literal means pydantic 422s any
+# other string before it ever reaches _apply_status, instead of echoing an
+# attacker-chosen string into the per-id error text (R-1, CWE-20/CWE-807, security
+# review t_837d8c25 probe P4). Shared by both BulkTaskBody and UpdateTaskBody so the
+# single-card PATCH route gets the same closed-set guarantee (N-2, t_5ee2994c / t_739be418).
+StatusVerb = Literal["done", "blocked", "scheduled", "review", "ready", "todo", "triage", "running"]
+
+# PATCH /tasks/:id also accepts "archived" directly (handled in _patch_status before
+# ever reaching _STATUS_HANDLERS/_apply_status), which the bulk path does not — bulk has
+# its own dedicated ``archive`` bool field instead. Keep that one extra verb out of
+# StatusVerb so it isn't silently legalized on the bulk route too.
+PatchStatus = Literal["done", "blocked", "scheduled", "review", "ready", "todo", "triage", "running", "archived"]
+
+
 class UpdateTaskBody(BaseModel):
-    status: Optional[str] = None
+    status: Optional[PatchStatus] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
     title: Optional[str] = None
@@ -561,17 +577,9 @@ class UpdateTaskBody(BaseModel):
     clear_reasoning_effort: bool = False
 
 
-# Closed set of status verbs the bulk path ever recognizes (handled by _STATUS_HANDLERS,
-# or deliberately rejected like "running" — see _RUNNING_DIRECT_MSG). Constraining the
-# field to this Literal means pydantic 422s any other string before it ever reaches
-# _apply_status, instead of echoing an attacker-chosen string into the per-id error text
-# (R-1, CWE-20/CWE-807, security review t_837d8c25 probe P4).
-BulkStatus = Literal["done", "blocked", "scheduled", "review", "ready", "todo", "triage", "running"]
-
-
 class BulkTaskBody(BaseModel):
     ids: list[str]
-    status: Optional[BulkStatus] = None
+    status: Optional[StatusVerb] = None
     assignee: Optional[str] = None  # "" or None = unassign
     priority: Optional[int] = None
     archive: bool = False

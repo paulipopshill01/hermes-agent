@@ -830,6 +830,23 @@ def test_bulk_unknown_status_rejected_at_validation(client):
         assert task is not None and task.status != "running"
 
 
+def test_patch_unknown_status_rejected_at_validation(client):
+    """N-2 (CWE-20/CWE-807, t_5ee2994c follow-up t_739be418): UpdateTaskBody.status
+    is now a closed Literal (PatchStatus) too, so the single-card PATCH route gets
+    the same validation-time guarantee as the bulk route — an attacker-chosen string
+    never reaches ``_patch_status`` and never gets echoed into the 400 detail;
+    pydantic 422s the whole request before any task is touched."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "running under a live worker claim — decoy text"},
+    )
+    assert r.status_code == 422, r.text
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, t["id"])
+        assert task is not None and task.status != "running"
+
+
 def test_bulk_error_code_not_found(client):
     r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": ["t_doesnotexist"], "status": "ready"})
     assert r.status_code == 200
