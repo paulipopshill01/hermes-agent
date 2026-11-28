@@ -814,6 +814,84 @@ def test_bulk_status_running_rejected(client):
     }
     assert statuses.get(t["id"]) != "running"
 
+def test_bulk_unknown_status_rejected_at_validation(client):
+    """R-1 (CWE-20/CWE-807, t_837d8c25 probe P4): BulkTaskBody.status is now a
+    closed Literal, so an attacker-chosen string never reaches the handler and
+    never gets echoed into a per-id ``error`` — pydantic 422s the whole request
+    before any task is touched."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [t["id"]], "status": "running under a live worker claim — decoy text"},
+    )
+    assert r.status_code == 422, r.text
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, t["id"])
+        assert task is not None and task.status != "running"
+
+
+def test_bulk_error_code_not_found(client):
+    r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": ["t_doesnotexist"], "status": "ready"})
+    assert r.status_code == 200
+    entry = r.json()["results"][0]
+    assert entry["ok"] is False
+    assert entry["error_code"] == "not_found"
+
+
+def test_bulk_error_code_parent_open(client):
+    """The gate refusal that matters (open parent on 'done') carries a fixed
+    error_code regardless of caller input — classification, not fence integrity."""
+    parent_id, child_id = _gated_child(client)
+    r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [child_id], "status": "done"})
+    assert r.status_code == 200
+    entry = r.json()["results"][0]
+    assert entry["ok"] is False
+    assert entry["error_code"] == "parent_open"
+    assert f"{parent_id} (ready)" in entry["error"], entry
+
+
+def test_bulk_error_code_live_claim(client, monkeypatch):
+    """A real live-claim refusal always carries error_code='live_claim', not a
+    caller-shapeable string (R-1)."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    live = client.post("/api/plugins/kanban/tasks", json={"title": "live worker 3"}).json()["task"]
+    with kbc.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, live["id"], claimer=f"{host}:worker")
+        kbd._set_worker_pid(conn, live["id"], 999997)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [live["id"]], "status": "done", "summary": "swept"},
+    )
+    assert r.status_code == 200, r.text
+    entry = r.json()["results"][0]
+    assert entry["ok"] is False
+    assert entry["error_code"] == "live_claim"
+
+
+def test_bulk_error_code_running_rejected(client):
+    """status='running' is still a closed, recognized value (not free text) but
+    remains a deliberate rejection — distinct code from a genuinely unknown verb."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [t["id"]], "status": "running"})
+    assert r.status_code == 200
+    entry = r.json()["results"][0]
+    assert entry["ok"] is False
+    assert entry["error_code"] == "running_rejected"
+
+
+def test_bulk_success_entries_carry_null_error_code(client):
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [a["id"]], "status": "ready"})
+    assert r.status_code == 200
+    entry = r.json()["results"][0]
+    assert entry["ok"] is True
+    assert entry["error_code"] is None
+
+
 def test_dashboard_confirm_dispatches_expected_patch_body(client):
     """Behavioral: the PATCH body shape the bundle produces on confirm
     (status + result + summary) must be accepted by the backend without

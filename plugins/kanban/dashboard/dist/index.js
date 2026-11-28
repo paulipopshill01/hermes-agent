@@ -1129,7 +1129,11 @@
             if (failed.length > 0) {
               setError(tx(t, "bulkFailed", "Bulk: ") +
                 `${failed.length} of ${res.results.length} failed: ` +
-                failed.slice(0, 3).map(function (f) { return `${f.id} (${f.error})`; }).join("; "));
+                // error_code (R-1) is the stable classifier; error is free text and
+                // may echo caller input, so it's shown but never the sole signal.
+                failed.slice(0, 3).map(function (f) {
+                  return f.error_code ? `${f.id} [${f.error_code}] (${f.error})` : `${f.id} (${f.error})`;
+                }).join("; "));
               setFailedIds(new Set(failed.map(function (f) { return f.id; })));
             } else {
               setFailedIds(new Set());

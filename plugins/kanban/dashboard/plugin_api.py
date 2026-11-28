@@ -21,7 +21,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Literal, Optional
 
 from fastapi import (
     APIRouter, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
@@ -561,9 +561,17 @@ class UpdateTaskBody(BaseModel):
     clear_reasoning_effort: bool = False
 
 
+# Closed set of status verbs the bulk path ever recognizes (handled by _STATUS_HANDLERS,
+# or deliberately rejected like "running" — see _RUNNING_DIRECT_MSG). Constraining the
+# field to this Literal means pydantic 422s any other string before it ever reaches
+# _apply_status, instead of echoing an attacker-chosen string into the per-id error text
+# (R-1, CWE-20/CWE-807, security review t_837d8c25 probe P4).
+BulkStatus = Literal["done", "blocked", "scheduled", "review", "ready", "todo", "triage", "running"]
+
+
 class BulkTaskBody(BaseModel):
     ids: list[str]
-    status: Optional[str] = None
+    status: Optional[BulkStatus] = None
     assignee: Optional[str] = None  # "" or None = unassign
     priority: Optional[int] = None
     archive: bool = False
@@ -584,6 +592,23 @@ class _StatusRejected(Exception):
 
 
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
+
+
+def _bulk_error_code(exc: BaseException) -> str:
+    """Stable machine-readable code for a bulk per-id refusal (R-1, CWE-807, security
+    review t_837d8c25): downstream UI/automation should gate on this field, not on
+    ``error`` free text, which can carry an attacker-shaped string (e.g. an unknown
+    status verb is otherwise echoed verbatim). A real gate/live-claim refusal always
+    carries its fixed exception-derived code regardless of caller input."""
+    if isinstance(exc, kanban_db.GateUnmetError):
+        return "gate_unmet"
+    if isinstance(exc, kanban_db.LiveClaimError):
+        return "live_claim"
+    if isinstance(exc, _StatusRejected):
+        return "running_rejected" if str(exc) == _RUNNING_DIRECT_MSG else "unknown_status"
+    if isinstance(exc, (ValueError, RuntimeError)):
+        return "value_error"
+    return "internal_error"
 
 
 def _drag_to(conn, task_id: str, s: str) -> bool:
@@ -854,9 +879,12 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
-    remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
+    remaining ops — except a rejected status verb (``_StatusRejected`` propagates). Every
+    ``ok=False`` write also sets ``error_code`` (R-1): a stable machine-readable classifier
+    alongside the free-text ``error``, so a badge/automation can gate on the code instead of
+    string-matching a message an unknown-status caller could otherwise shape."""
     if payload.archive and not kanban_db.archive_task(conn, tid):
-        entry.update(ok=False, error="archive refused")
+        entry.update(ok=False, error="archive refused", error_code="archive_refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
         # force=False: a bulk sweep must not silently override a live worker claim on
@@ -864,24 +892,28 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
         # row raises LiveClaimError here, caught by bulk_update's per-id try/except below
         # into this same refusal-reporting path, same as any other per-id bulk failure.
         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}", force=False):
-            entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
+            refusal = _open_parent_refusal(conn, tid, s)
+            if refusal:
+                entry.update(ok=False, error=refusal, error_code="parent_open")
+            else:
+                entry.update(ok=False, error=f"transition to {s!r} refused", error_code="transition_refused")
     if payload.assignee is not None:
         try:
             ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first
                   else kanban_db.assign_task(conn, tid, payload.assignee or None))
             if not ok:
-                entry.update(ok=False, error="assign refused")
+                entry.update(ok=False, error="assign refused", error_code="assign_refused")
         except RuntimeError as e:
-            entry.update(ok=False, error=str(e))
+            entry.update(ok=False, error=str(e), error_code="assign_error")
     if payload.priority is not None:
         _set_priority(conn, tid, payload.priority, board)
     for wanted, apply, refused in _OVERRIDE_OPS:
         if wanted(payload):
             try:
                 if not apply(conn, tid, payload):
-                    entry.update(ok=False, error=refused)
+                    entry.update(ok=False, error=refused, error_code="override_refused")
             except (ValueError, RuntimeError) as e:
-                entry.update(ok=False, error=str(e))
+                entry.update(ok=False, error=str(e), error_code="override_error")
 
 
 @router.post("/tasks/bulk")
@@ -894,14 +926,14 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     results: list[dict] = []
     with _board_conn(board) as (board, conn):
         for tid in ids:
-            entry: dict[str, Any] = {"id": tid, "ok": True}
+            entry: dict[str, Any] = {"id": tid, "ok": True, "error_code": None}
             try:
                 if kanban_db.get_task(conn, tid) is None:
-                    entry.update(ok=False, error="not found")
+                    entry.update(ok=False, error="not found", error_code="not_found")
                 else:
                     _bulk_apply_one(conn, tid, payload, board, entry)
             except Exception as e:  # one bad id shouldn't kill the batch (incl. _StatusRejected)
-                entry.update(ok=False, error=str(e))
+                entry.update(ok=False, error=str(e), error_code=_bulk_error_code(e))
             results.append(entry)
         return {"results": results}
 
